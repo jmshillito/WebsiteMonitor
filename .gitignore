@@ -2,4 +2,11 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+imports/
+output/
+*.pdf
+*.zip
+baseline_news_posts.csv
+news_posts_dated_*.csv
+last_seen_posts.json
 ga4-reporting/keys/*.json
