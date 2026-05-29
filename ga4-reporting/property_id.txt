@@ -1,0 +1,1 @@
+Deprecated. Use ga4-reporting/property_ids.tsv instead.
