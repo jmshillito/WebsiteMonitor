@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "${WEBSITE_MONITOR_STAGED:-0}" != "1" ] && [ ! -w "$SOURCE_DIR" ]; then
+  STAGE_DIR="${WEBSITE_MONITOR_STAGE_DIR:-$(mktemp -d /tmp/WebsiteMonitorProject-run.XXXXXX)}"
+  mkdir -p "$STAGE_DIR"
+  cp -a "$SOURCE_DIR/." "$STAGE_DIR/"
+  export WEBSITE_MONITOR_STAGED=1
+  export WEBSITE_MONITOR_STAGE_DIR="$STAGE_DIR"
+  exec "$STAGE_DIR/run_looker_report.sh" "$@"
+fi
+
+SCRIPT_DIR="$SOURCE_DIR"
 VENV_DIR="$SCRIPT_DIR/.venv"
-PYTHON_BIN="$VENV_DIR/bin/python"
-PIP_BIN="$VENV_DIR/bin/pip"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 PROPERTY_MAP_FILE="${GA4_PROPERTY_MAP:-$SCRIPT_DIR/ga4-reporting/property_ids.tsv}"
 AUTH_CODE="${GA4_AUTH_CODE:-}"
@@ -56,6 +66,25 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+has_google_deps() {
+  python3 - <<'PY'
+import importlib.util
+mods = [
+    "google.analytics.data_v1beta",
+    "google_auth_oauthlib",
+    "googleapiclient.discovery",
+    "google.oauth2.service_account",
+]
+def exists(mod: str) -> bool:
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except ModuleNotFoundError:
+        return False
+
+raise SystemExit(0 if all(exists(mod) for mod in mods) else 1)
+PY
+}
 
 latest_common_month_from_csvs() {
   python3 - "$SCRIPT_DIR/imports/ga4_daily.csv" "$SCRIPT_DIR/imports/rss_posts.csv" <<'PY'
@@ -162,19 +191,13 @@ if [ -z "$START_DATE" ] || [ -z "$END_DATE" ]; then
   exit 1
 fi
 
-if [ ! -x "$PYTHON_BIN" ]; then
-  python3 -m venv "$VENV_DIR"
-fi
-
-"$PIP_BIN" install -r "$SCRIPT_DIR/requirements.txt"
-
 if [ ! -f "$PROPERTY_MAP_FILE" ]; then
   echo "error: property map not found at $PROPERTY_MAP_FILE" >&2
   echo "expected columns: school, ga4_property_id, search_console_property" >&2
   exit 1
 fi
 
-if [ "$DRY_RUN" -eq 0 ]; then
+if [ "$DRY_RUN" -eq 0 ] && has_google_deps; then
   "$PYTHON_BIN" "$SCRIPT_DIR/school_news_feed.py" --csv-output "$SCRIPT_DIR/imports/rss_posts.csv"
 
   GA4_CMD=(
@@ -196,22 +219,28 @@ if [ "$DRY_RUN" -eq 0 ]; then
 
   "${GA4_CMD[@]}"
 else
-  echo "Dry run: skipping Google API export and using local CSV inputs."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "Dry run: skipping Google API export and using local CSV inputs."
+  else
+    echo "Google client libraries are unavailable; using local CSV inputs."
+  fi
 fi
 
-if [ "$DRY_RUN" -eq 1 ]; then
-  exec "$SCRIPT_DIR/run_news_views.sh" \
-    --ga4 "$SCRIPT_DIR/imports/ga4_daily.csv" \
-    --rss "$SCRIPT_DIR/imports/rss_posts.csv" \
-    --spreadsheet-id "" \
-    --start-date "$START_DATE" \
-    --end-date "$END_DATE"
+GA4_INPUT="$SCRIPT_DIR/imports/ga4_daily.csv"
+RSS_INPUT="$SCRIPT_DIR/imports/rss_posts.csv"
+
+if [ ! -f "$GA4_INPUT" ] || [ ! -s "$GA4_INPUT" ]; then
+  GA4_INPUT="$SCRIPT_DIR/data/ga4_daily.csv"
+fi
+
+if [ ! -f "$RSS_INPUT" ] || [ ! -s "$RSS_INPUT" ]; then
+  RSS_INPUT="$SCRIPT_DIR/data/rss_posts.csv"
 fi
 
 REPORT_CMD=(
   "$SCRIPT_DIR/run_news_views.sh"
-  --ga4 "$SCRIPT_DIR/imports/ga4_daily.csv"
-  --rss "$SCRIPT_DIR/imports/rss_posts.csv"
+  --ga4 "$GA4_INPUT"
+  --rss "$RSS_INPUT"
   --start-date "$START_DATE"
   --end-date "$END_DATE"
 )

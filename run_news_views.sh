@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "${WEBSITE_MONITOR_STAGED:-0}" != "1" ] && [ ! -w "$SOURCE_DIR" ]; then
+  STAGE_DIR="${WEBSITE_MONITOR_STAGE_DIR:-$(mktemp -d /tmp/WebsiteMonitorProject-run.XXXXXX)}"
+  mkdir -p "$STAGE_DIR"
+  cp -a "$SOURCE_DIR/." "$STAGE_DIR/"
+  export WEBSITE_MONITOR_STAGED=1
+  export WEBSITE_MONITOR_STAGE_DIR="$STAGE_DIR"
+  exec "$STAGE_DIR/run_news_views.sh" "$@"
+fi
+
+SCRIPT_DIR="$SOURCE_DIR"
 VENV_DIR="$SCRIPT_DIR/.venv"
-PYTHON_BIN="$VENV_DIR/bin/python"
-PIP_BIN="$VENV_DIR/bin/pip"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 DEFAULT_GA4="$SCRIPT_DIR/data/ga4_daily.csv"
 DEFAULT_RSS="$SCRIPT_DIR/data/rss_posts.csv"
 DEFAULT_SPREADSHEET_ID="109tHI2m1olk6oXMZbV_OOneUT7apMbRJCQkYxXldA1I"
@@ -159,11 +169,9 @@ if best_path:
 PY
 }
 
-if [ ! -x "$PYTHON_BIN" ]; then
-  python3 -m venv "$VENV_DIR"
+if [ -x "$VENV_DIR/bin/python" ]; then
+  PYTHON_BIN="$VENV_DIR/bin/python"
 fi
-
-"$PIP_BIN" install -r "$SCRIPT_DIR/requirements.txt"
 
 GA4_INPUT="$DEFAULT_GA4"
 RSS_INPUT="$DEFAULT_RSS"

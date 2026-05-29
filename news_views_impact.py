@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+import csv
+from email.utils import parsedate_to_datetime
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-
-import pandas as pd
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from statistics import mean
+from typing import Any
 
 
 GA4_REQUIRED_COLUMNS = {"school", "date", "views"}
@@ -21,7 +21,6 @@ DEFAULT_SERVICE_ACCOUNT_FILE = Path("ga4-reporting/keys/service-account.json")
 DEFAULT_VIEWS_SHEET_NAME = "Views and Clicks"
 DEFAULT_POST_IMPACT_SHEET_NAME = "Post Impact"
 DEFAULT_POST_DETAILS_SHEET_NAME = "Post Details"
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 GA4_SCHOOL_CODES = [
     "CHHS",
     "CIFEC",
@@ -122,9 +121,7 @@ def parse_args() -> InputPaths:
     )
 
     args = parser.parse_args()
-    spreadsheet_id = None
-    if args.spreadsheet_id is not None:
-        spreadsheet_id = str(args.spreadsheet_id).strip() or None
+    spreadsheet_id = None if args.spreadsheet_id is None else str(args.spreadsheet_id).strip() or None
     return InputPaths(
         ga4=args.ga4,
         rss=args.rss,
@@ -140,231 +137,280 @@ def parse_args() -> InputPaths:
     )
 
 
+def parse_iso_date(value: str, label: str) -> date:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{label} is empty")
+
+    candidates = [
+        text,
+        text.replace("Z", "+00:00"),
+    ]
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate).date()
+        except ValueError:
+            pass
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%b-%y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+
+    try:
+        return parsedate_to_datetime(text).date()
+    except Exception:
+        pass
+
+    raise ValueError(f"{label} must use a recognizable date format: {value!r}")
+
+
 def parse_date_range(
     month: str | None,
     start_date: str | None,
     end_date: str | None,
-) -> tuple[str | None, pd.Timestamp | None, pd.Timestamp | None]:
+) -> tuple[str | None, date | None, date | None]:
     if month is not None:
         try:
-            month_start = pd.Timestamp(f"{month}-01")
+            month_start = datetime.strptime(f"{month}-01", "%Y-%m-%d").date()
         except ValueError as exc:
             raise ValueError("--month must use YYYY-MM format") from exc
 
-        month_end = month_start + pd.offsets.MonthEnd(0)
-        return month, month_start.normalize(), month_end.normalize()
+        if month_start.month == 12:
+            month_end = date(month_start.year, 12, 31)
+        else:
+            month_end = date(month_start.year, month_start.month + 1, 1) - timedelta(days=1)
+        return month, month_start, month_end
 
     if start_date is None and end_date is None:
         return None, None, None
     if start_date is None or end_date is None:
         raise ValueError("--start-date and --end-date must be provided together")
 
-    try:
-        parsed_start = pd.Timestamp(start_date)
-        parsed_end = pd.Timestamp(end_date)
-    except ValueError as exc:
-        raise ValueError("--start-date and --end-date must use YYYY-MM-DD format") from exc
+    parsed_start = parse_iso_date(start_date, "--start-date")
+    parsed_end = parse_iso_date(end_date, "--end-date")
 
     if parsed_end < parsed_start:
         raise ValueError("--end-date must be on or after --start-date")
 
-    return f"{parsed_start:%Y-%m-%d}_to_{parsed_end:%Y-%m-%d}", parsed_start.normalize(), parsed_end.normalize()
+    return f"{parsed_start:%Y-%m-%d}_to_{parsed_end:%Y-%m-%d}", parsed_start, parsed_end
 
 
-def load_csv(path: Path, label: str) -> pd.DataFrame:
+def load_csv(path: Path, label: str) -> list[dict[str, str]]:
     if not path.exists():
         raise FileNotFoundError(f"{label} file not found: {path}")
-    return pd.read_csv(path)
+
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    return rows
 
 
-def normalize_school_series(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip().str.upper()
+def normalize_school(value: Any) -> str:
+    return str(value or "").strip().upper()
 
 
-def normalize_date_series(series: pd.Series, label: str) -> pd.Series:
-    parsed = pd.to_datetime(series, errors="coerce", utc=True).dt.tz_convert(None)
-    missing = parsed.isna().sum()
-    if missing:
-        warn(f"{label}: {missing} row(s) could not be parsed as dates and will be dropped.")
-    return parsed.dt.normalize()
+def normalize_text(value: Any) -> str:
+    return str(value or "").strip()
 
 
-def prepare_ga4(df: pd.DataFrame, month_start: pd.Timestamp | None, month_end: pd.Timestamp | None) -> pd.DataFrame:
-    missing = GA4_REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"GA4 CSV is missing required columns: {sorted(missing)}")
-
-    ga4 = df.copy()
-    ga4.columns = [str(col).strip().lower() for col in ga4.columns]
-    ga4["school"] = normalize_school_series(ga4["school"])
-    ga4["date"] = normalize_date_series(ga4["date"], "GA4")
-    ga4["views"] = pd.to_numeric(ga4["views"], errors="coerce")
-    if "users" not in ga4.columns:
-        ga4["users"] = pd.NA
-    ga4["users"] = pd.to_numeric(ga4["users"], errors="coerce")
-
-    if ga4["views"].isna().any():
-        warn("GA4: some views values could not be converted to numbers and will be dropped.")
-
-    ga4 = ga4.dropna(subset=["school", "date", "views"]).copy()
-    if ga4["views"].dropna().mod(1).eq(0).all():
-        ga4["views"] = ga4["views"].astype("Int64")
-    else:
-        ga4["views"] = ga4["views"].astype(float)
-    if ga4["users"].dropna().mod(1).eq(0).all():
-        ga4["users"] = ga4["users"].fillna(0).astype("Int64")
-    else:
-        ga4["users"] = ga4["users"].fillna(0).astype(float)
-
-    if month_start is not None and month_end is not None:
-        ga4 = ga4[(ga4["date"] >= month_start) & (ga4["date"] <= month_end)].copy()
-
-    return ga4
+def to_number(value: Any) -> float | int | None:
+    text = normalize_text(value)
+    if text == "":
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    if number.is_integer():
+        return int(number)
+    return number
 
 
-def prepare_rss(df: pd.DataFrame, month_start: pd.Timestamp | None, month_end: pd.Timestamp | None) -> pd.DataFrame:
-    rss = df.copy()
-    rss.columns = [str(col).strip().lower() for col in rss.columns]
-
-    # Accept both the requested input schema and the current RSS script output schema.
-    rename_map: dict[str, str] = {}
-    if "post_date" not in rss.columns and "last date" in rss.columns:
-        rename_map["last date"] = "post_date"
-    if "post_title" not in rss.columns and "title" in rss.columns:
-        rename_map["title"] = "post_title"
-    if "post_url" not in rss.columns and "link" in rss.columns:
-        rename_map["link"] = "post_url"
-    if "school" not in rss.columns and "ga4 school" in rss.columns:
-        rename_map["ga4 school"] = "school"
-    rss = rss.rename(columns=rename_map)
-
-    missing = RSS_REQUIRED_COLUMNS - set(rss.columns)
-    if missing:
-        raise ValueError(f"RSS CSV is missing required columns: {sorted(missing)}")
-
-    if "post_date" not in rss.columns:
-        raise ValueError("RSS CSV is missing required column: post_date")
-    if "post_title" not in rss.columns:
-        rss["post_title"] = ""
-    if "post_url" not in rss.columns:
-        rss["post_url"] = ""
-
-    if "ga4 school" in rss.columns:
-        rss["school"] = normalize_school_series(rss["ga4 school"])
-    else:
-        rss["school"] = normalize_school_series(rss["school"])
-
-    rss = rss[~rss["school"].str.startswith("UPDATED ON", na=False)].copy()
-
-    rss["post_date"] = normalize_date_series(rss["post_date"], "RSS")
-    rss["post_title"] = rss["post_title"].fillna("").astype(str)
-    rss["post_url"] = rss["post_url"].fillna("").astype(str)
-
-    rss = rss.dropna(subset=["school", "post_date"]).copy()
-
-    if month_start is not None and month_end is not None:
-        rss = rss[(rss["post_date"] >= month_start) & (rss["post_date"] <= month_end)].copy()
-
-    return rss
+def format_number(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    return normalize_text(value)
 
 
-def build_news_daily_summary(rss: pd.DataFrame) -> pd.DataFrame:
-    daily = (
-        rss.groupby(["school", "post_date"], as_index=False)
-        .agg(news_posts_count=("post_title", "size"))
-        .rename(columns={"post_date": "date"})
-    )
-    daily["date"] = pd.to_datetime(daily["date"]).dt.normalize()
-    return daily
+def format_output_date(value: date | None) -> str:
+    return "" if value is None else value.strftime("%Y-%m-%d")
 
 
-def add_rolling_post_flags(merged: pd.DataFrame, news_daily: pd.DataFrame) -> pd.DataFrame:
-    merged = merged.sort_values(["school", "date"]).copy()
-
-    merged["last_post_date"] = ""
-    merged["days_since_last_post"] = pd.NA
-    merged["within_1_day_post"] = False
-    merged["within_3_days_post"] = False
-    merged["within_7_days_post"] = False
-
-    post_dates_by_school: dict[str, list[pd.Timestamp]] = {}
-    for school, group in news_daily.sort_values(["school", "date"]).groupby("school", sort=False):
-        post_dates_by_school[school] = [pd.Timestamp(value) for value in group["date"].tolist()]
-
-    for school, group in merged.groupby("school", sort=False):
-        post_dates = post_dates_by_school.get(school, [])
-        post_index = 0
-        current_last_post: pd.Timestamp | pd.NaT = pd.NaT
-        last_post_dates: list[str] = []
-        days_since_last: list[int | pd.NA] = []
-        within_1: list[bool] = []
-        within_3: list[bool] = []
-        within_7: list[bool] = []
-
-        for _, row in group.iterrows():
-            row_date = pd.Timestamp(row["date"])
-
-            while post_index < len(post_dates) and post_dates[post_index] <= row_date:
-                current_last_post = post_dates[post_index]
-                post_index += 1
-
-            last_post_dates.append(current_last_post.strftime("%Y-%m-%d") if pd.notna(current_last_post) else "")
-            if pd.isna(current_last_post):
-                days_since_last.append(pd.NA)
-                within_1.append(False)
-                within_3.append(False)
-                within_7.append(False)
-                continue
-
-            delta_days = int((row_date - current_last_post).days)
-            days_since_last.append(delta_days)
-            within_1.append(delta_days <= 1)
-            within_3.append(delta_days <= 3)
-            within_7.append(delta_days <= 7)
-
-        merged.loc[group.index, "last_post_date"] = last_post_dates
-        merged.loc[group.index, "days_since_last_post"] = days_since_last
-        merged.loc[group.index, "within_1_day_post"] = within_1
-        merged.loc[group.index, "within_3_days_post"] = within_3
-        merged.loc[group.index, "within_7_days_post"] = within_7
-
-    merged["is_post_day"] = merged["news_posts_count"] > 0
-    merged["date"] = pd.to_datetime(merged["date"]).dt.strftime("%Y-%m-%d")
-    merged["last_post_date"] = merged["last_post_date"].fillna("")
-    merged["days_since_last_post"] = merged["days_since_last_post"].astype("Int64")
-    merged["news_posts_count"] = merged["news_posts_count"].fillna(0).astype(int)
-
-    return merged
+def safe_mean(values: list[float | int]) -> float | None:
+    if not values:
+        return None
+    return float(mean(values))
 
 
-def safe_pct_change(numerator: float | int | None, denominator: float | int | None) -> float | pd.NA:
+def safe_pct_change(numerator: float | int | None, denominator: float | int | None) -> float | None:
     if numerator is None or denominator is None:
-        return pd.NA
-    if pd.isna(numerator) or pd.isna(denominator) or denominator == 0:
-        return pd.NA
+        return None
+    if denominator == 0:
+        return None
     return ((float(numerator) - float(denominator)) / float(denominator)) * 100.0
 
 
-def build_school_summary(merged: pd.DataFrame) -> pd.DataFrame:
-    records: list[dict[str, object]] = []
+def prepare_ga4(rows: list[dict[str, str]], month_start: date | None, month_end: date | None) -> list[dict[str, Any]]:
+    if not rows:
+        return []
 
-    all_schools = GA4_SCHOOL_CODES
-    for school in all_schools:
-        school_df = merged[merged["school"] == school].copy()
-        total_posts = int(school_df["news_posts_count"].sum())
-        avg_views_all_days = school_df["views"].mean()
+    columns = {str(col).strip().lower() for col in rows[0].keys()}
+    missing = GA4_REQUIRED_COLUMNS - columns
+    if missing:
+        raise ValueError(f"GA4 CSV is missing required columns: {sorted(missing)}")
 
-        post_days = school_df[school_df["is_post_day"]]
-        recent_1 = school_df[school_df["days_since_last_post"].between(0, 1, inclusive="both")]
-        recent_3 = school_df[school_df["days_since_last_post"].between(0, 3, inclusive="both")]
-        recent_7 = school_df[school_df["days_since_last_post"].between(0, 7, inclusive="both")]
-        no_recent = school_df[school_df["days_since_last_post"].isna() | (school_df["days_since_last_post"] > 7)]
+    prepared: list[dict[str, Any]] = []
+    for raw in rows:
+        row = {str(key).strip().lower(): value for key, value in raw.items()}
+        school = normalize_school(row.get("school"))
+        date_value = row.get("date")
+        views = to_number(row.get("views"))
+        if not school or not date_value or views is None:
+            continue
 
-        avg_views_on_post_days = post_days["views"].mean()
-        avg_views_within_1_day = recent_1["views"].mean()
-        avg_views_within_3_days = recent_3["views"].mean()
-        avg_views_within_7_days = recent_7["views"].mean()
-        avg_views_no_recent_post = no_recent["views"].mean()
+        parsed_date = parse_iso_date(date_value, "GA4 date")
+        if month_start is not None and month_end is not None and not (month_start <= parsed_date <= month_end):
+            continue
+
+        prepared.append(
+            {
+                "school": school,
+                "date": parsed_date,
+                "views": views,
+                "users": to_number(row.get("users")),
+                "clicks": to_number(row.get("clicks")),
+                "impressions": to_number(row.get("impressions")),
+                "ctr": to_number(row.get("ctr")),
+                "position": to_number(row.get("position")),
+            }
+        )
+
+    if any(row["views"] is None for row in prepared):
+        warn("GA4: some views values could not be converted to numbers and were dropped.")
+
+    return prepared
+
+
+def prepare_rss(rows: list[dict[str, str]], month_start: date | None, month_end: date | None) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    for raw in rows:
+        row = {str(key).strip().lower(): value for key, value in raw.items()}
+
+        school_source = row.get("ga4 school") if row.get("ga4 school") else row.get("school")
+        school = normalize_school(school_source)
+        if not school or school.startswith("UPDATED ON"):
+            continue
+
+        post_date_raw = row.get("post_date") or row.get("last date")
+        if not post_date_raw:
+            continue
+
+        post_date = parse_iso_date(post_date_raw, "RSS post_date")
+        if month_start is not None and month_end is not None and not (month_start <= post_date <= month_end):
+            continue
+
+        prepared.append(
+            {
+                "school": school,
+                "post_date": post_date,
+                "post_title": normalize_text(row.get("post_title") or row.get("title")),
+                "post_url": normalize_text(row.get("post_url") or row.get("link")),
+            }
+        )
+
+    return prepared
+
+
+def build_news_daily_summary(rss: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[tuple[str, date], int] = defaultdict(int)
+    for row in rss:
+        counts[(row["school"], row["post_date"])] += 1
+
+    return [
+        {"school": school, "date": post_date, "news_posts_count": count}
+        for (school, post_date), count in sorted(counts.items(), key=lambda item: (item[0][0], item[0][1]))
+    ]
+
+
+def add_rolling_post_flags(
+    merged: list[dict[str, Any]],
+    news_daily: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    post_dates_by_school: dict[str, list[date]] = defaultdict(list)
+    for row in news_daily:
+        post_dates_by_school[row["school"]].append(row["date"])
+
+    for school in post_dates_by_school:
+        post_dates_by_school[school].sort()
+
+    output: list[dict[str, Any]] = []
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in merged:
+        grouped[row["school"]].append(row)
+
+    for school in sorted(grouped):
+        rows = sorted(grouped[school], key=lambda row: row["date"])
+        post_dates = post_dates_by_school.get(school, [])
+        post_index = 0
+        current_last_post: date | None = None
+
+        for row in rows:
+            while post_index < len(post_dates) and post_dates[post_index] <= row["date"]:
+                current_last_post = post_dates[post_index]
+                post_index += 1
+
+            enriched = dict(row)
+            enriched["last_post_date"] = format_output_date(current_last_post)
+            if current_last_post is None:
+                enriched["days_since_last_post"] = None
+                enriched["within_1_day_post"] = False
+                enriched["within_3_days_post"] = False
+                enriched["within_7_days_post"] = False
+            else:
+                delta_days = (row["date"] - current_last_post).days
+                enriched["days_since_last_post"] = delta_days
+                enriched["within_1_day_post"] = delta_days <= 1
+                enriched["within_3_days_post"] = delta_days <= 3
+                enriched["within_7_days_post"] = delta_days <= 7
+
+            enriched["is_post_day"] = int(row.get("news_posts_count", 0)) > 0
+            output.append(enriched)
+
+    return sorted(output, key=lambda row: (row["school"], row["date"]))
+
+
+def build_school_summary(merged: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_school: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in merged:
+        by_school[row["school"]].append(row)
+
+    records: list[dict[str, Any]] = []
+    for school in GA4_SCHOOL_CODES:
+        rows = by_school.get(school, [])
+        total_posts = sum(int(row.get("news_posts_count", 0) or 0) for row in rows)
+        avg_views_all_days = safe_mean([float(row["views"]) for row in rows])
+
+        post_days = [row for row in rows if row["is_post_day"]]
+        recent_1 = [row for row in rows if row.get("days_since_last_post") is not None and row["days_since_last_post"] <= 1]
+        recent_3 = [row for row in rows if row.get("days_since_last_post") is not None and row["days_since_last_post"] <= 3]
+        recent_7 = [row for row in rows if row.get("days_since_last_post") is not None and row["days_since_last_post"] <= 7]
+        no_recent = [row for row in rows if row.get("days_since_last_post") is None or row["days_since_last_post"] > 7]
+
+        avg_views_on_post_days = safe_mean([float(row["views"]) for row in post_days])
+        avg_views_within_1_day = safe_mean([float(row["views"]) for row in recent_1])
+        avg_views_within_3_days = safe_mean([float(row["views"]) for row in recent_3])
+        avg_views_within_7_days = safe_mean([float(row["views"]) for row in recent_7])
+        avg_views_no_recent_post = safe_mean([float(row["views"]) for row in no_recent])
 
         records.append(
             {
@@ -384,8 +430,106 @@ def build_school_summary(merged: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    summary = pd.DataFrame.from_records(records)
-    numeric_columns = [
+    return records
+
+
+def build_event_impact(rss: list[dict[str, Any]], merged: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    views_lookup: dict[tuple[str, date], list[float]] = defaultdict(list)
+    for row in merged:
+        views_lookup[(row["school"], row["date"])].append(float(row["views"]))
+
+    school_dates: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    for row in merged:
+        school_dates[row["school"]].append((row["date"], float(row["views"])))
+    for school in school_dates:
+        school_dates[school].sort(key=lambda item: item[0])
+
+    event_rows: list[dict[str, Any]] = []
+    for post in sorted(rss, key=lambda row: (row["school"], row["post_date"], row["post_title"])):
+        school = post["school"]
+        post_date = post["post_date"]
+        rows = school_dates.get(school, [])
+
+        views_on_post_day = safe_mean(views_lookup.get((school, post_date), []))
+        before_window = [views for row_date, views in rows if post_date - timedelta(days=3) <= row_date < post_date]
+        after_window = [views for row_date, views in rows if post_date < row_date <= post_date + timedelta(days=3)]
+
+        avg_before = safe_mean(before_window)
+        avg_after = safe_mean(after_window)
+        change = None if avg_before is None or avg_after is None else avg_after - avg_before
+        change_pct = safe_pct_change(avg_after, avg_before)
+        increased = avg_before is not None and avg_after is not None and avg_after > avg_before
+
+        event_rows.append(
+            {
+                "school": school,
+                "post_date": post_date,
+                "post_title": post["post_title"],
+                "post_url": post["post_url"],
+                "views_on_post_day": views_on_post_day,
+                "avg_views_3_days_before": avg_before,
+                "avg_views_3_days_after": avg_after,
+                "view_change_after_post": change,
+                "view_change_after_post_pct": change_pct,
+                "views_increased_after_post": increased,
+            }
+        )
+
+    return event_rows
+
+
+def warn_school_mismatches(ga4: list[dict[str, Any]], rss: list[dict[str, Any]]) -> None:
+    ga4_schools = {row["school"] for row in ga4}
+    rss_schools = {row["school"] for row in rss}
+    unexpected_rss = sorted(rss_schools - ga4_schools)
+    if unexpected_rss:
+        warn(f"RSS school codes not found in GA4 data: {unexpected_rss}")
+
+
+def format_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, (int, float)):
+        return format_number(value)
+    return normalize_text(value)
+
+
+def output_rows_from_dicts(rows: list[dict[str, Any]], columns: list[str]) -> list[list[str]]:
+    return [columns] + [[format_cell(row.get(column)) for column in columns] for row in rows]
+
+
+def build_views_and_clicks_sheet(merged: list[dict[str, Any]], month: str | None) -> list[list[str]]:
+    rows = []
+    for row in merged:
+        month_value = month or row["date"].strftime("%Y-%m")
+        rows.append(
+            {
+                "Date": row["date"],
+                "Month": month_value,
+                "School": row["school"],
+                "Views": row["views"],
+                "Clicks": row.get("clicks"),
+                "Users": row.get("users"),
+                "Posts": row.get("news_posts_count", 0),
+                "Notes": "",
+            }
+        )
+
+    rows.sort(key=lambda row: (row["School"], row["Date"]))
+    columns = ["Date", "Month", "School", "Views", "Clicks", "Users", "Posts", "Notes"]
+    return output_rows_from_dicts(rows, columns)
+
+
+def build_post_impact_sheet(summary: list[dict[str, Any]]) -> list[list[str]]:
+    rows = [dict(row) for row in sorted(summary, key=lambda row: row["school"])]
+    columns = [
+        "school",
+        "total_posts",
+        "no_news_posts_in_period",
         "avg_views_all_days",
         "avg_views_on_post_days",
         "avg_views_within_1_day",
@@ -397,208 +541,119 @@ def build_school_summary(merged: pd.DataFrame) -> pd.DataFrame:
         "view_lift_within_3_days_pct",
         "view_lift_within_7_days_pct",
     ]
-    for column in numeric_columns:
-        if column in summary.columns:
-            summary[column] = pd.to_numeric(summary[column], errors="coerce").round(2)
-    return summary
+    if rows and "month" in rows[0]:
+        columns.append("month")
+
+    headers = [column.replace("_", " ").title() if column != "month" else "Month" for column in columns]
+    return [headers] + [[format_cell(row.get(column)) for column in columns] for row in rows]
 
 
-def build_event_impact(rss: pd.DataFrame, merged: pd.DataFrame) -> pd.DataFrame:
-    event_rows: list[dict[str, object]] = []
-    views_lookup = merged[["school", "date", "views"]].copy()
-    views_lookup["date"] = pd.to_datetime(views_lookup["date"])
+def build_post_details_sheet(events: list[dict[str, Any]]) -> list[list[str]]:
+    rows = sorted(events, key=lambda row: (row["school"], row["post_date"], row["post_title"]))
+    columns = [
+        "school",
+        "post_date",
+        "post_title",
+        "post_url",
+        "views_on_post_day",
+        "avg_views_3_days_before",
+        "avg_views_3_days_after",
+        "view_change_after_post",
+        "view_change_after_post_pct",
+        "views_increased_after_post",
+    ]
+    if rows and "month" in rows[0]:
+        columns.append("month")
 
-    for _, post in rss.sort_values(["school", "post_date", "post_title"]).iterrows():
-        school = post["school"]
-        post_date = pd.Timestamp(post["post_date"])
-        school_views = views_lookup[views_lookup["school"] == school].copy()
-
-        on_day_match = school_views[school_views["date"] == post_date]
-        views_on_post_day = on_day_match["views"].mean() if not on_day_match.empty else pd.NA
-
-        before_window = school_views[
-            (school_views["date"] >= post_date - pd.Timedelta(days=3))
-            & (school_views["date"] < post_date)
-        ]
-        after_window = school_views[
-            (school_views["date"] > post_date)
-            & (school_views["date"] <= post_date + pd.Timedelta(days=3))
-        ]
-
-        avg_views_3_days_before = before_window["views"].mean()
-        avg_views_3_days_after = after_window["views"].mean()
-        view_change_after_post = (
-            avg_views_3_days_after - avg_views_3_days_before
-            if pd.notna(avg_views_3_days_after) and pd.notna(avg_views_3_days_before)
-            else pd.NA
-        )
-        view_change_after_post_pct = safe_pct_change(avg_views_3_days_after, avg_views_3_days_before)
-        views_increased_after_post = bool(
-            pd.notna(avg_views_3_days_after)
-            and pd.notna(avg_views_3_days_before)
-            and avg_views_3_days_after > avg_views_3_days_before
-        )
-
-        event_rows.append(
-            {
-                "school": school,
-                "post_date": post_date.strftime("%Y-%m-%d"),
-                "post_title": post["post_title"],
-                "post_url": post["post_url"],
-                "views_on_post_day": views_on_post_day,
-                "avg_views_3_days_before": avg_views_3_days_before,
-                "avg_views_3_days_after": avg_views_3_days_after,
-                "view_change_after_post": view_change_after_post,
-                "view_change_after_post_pct": view_change_after_post_pct,
-                "views_increased_after_post": views_increased_after_post,
-            }
-        )
-
-    return pd.DataFrame.from_records(
-        event_rows,
-        columns=[
-            "school",
-            "post_date",
-            "post_title",
-            "post_url",
-            "views_on_post_day",
-            "avg_views_3_days_before",
-            "avg_views_3_days_after",
-            "view_change_after_post",
-            "view_change_after_post_pct",
-            "views_increased_after_post",
-        ],
-    )
+    headers = [column.replace("_", " ").title() if column != "month" else "Month" for column in columns]
+    return [headers] + [[format_cell(row.get(column)) for column in columns] for row in rows]
 
 
-def warn_school_mismatches(ga4: pd.DataFrame, rss: pd.DataFrame) -> None:
-    ga4_schools = set(ga4["school"].dropna().unique().tolist())
-    rss_schools = set(rss["school"].dropna().unique().tolist())
-
-    unexpected_rss = sorted(rss_schools - ga4_schools)
-    if unexpected_rss:
-        warn(f"RSS school codes not found in GA4 data: {unexpected_rss}")
-
-
-def sheet_name_range(sheet_name: str) -> str:
-    escaped = sheet_name.replace("'", "''")
-    return f"'{escaped}'!A:Z"
+def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: format_cell(row.get(column)) for column in columns})
 
 
-def quoted_sheet_name(sheet_name: str) -> str:
-    return sheet_name_range(sheet_name).split("!")[0]
+def write_table_csv(path: Path, table: list[list[str]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(table)
 
 
-def load_sheets_service(service_account_file: Path):
+def maybe_upload_to_sheets(
+    spreadsheet_id: str,
+    service_account_file: Path,
+    views_sheet_name: str,
+    post_impact_sheet_name: str,
+    post_details_sheet_name: str,
+    merged: list[dict[str, Any]],
+    summary: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    month: str | None,
+) -> bool:
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+    except Exception:
+        warn("Google Sheets upload skipped because google client libraries are not installed.")
+        return False
+
     if not service_account_file.exists():
         raise FileNotFoundError(f"Service account file not found: {service_account_file}")
 
-    credentials = service_account.Credentials.from_service_account_file(
-        service_account_file,
-        scopes=SHEETS_SCOPES,
-    )
-    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = service_account.Credentials.from_service_account_file(service_account_file, scopes=scopes)
+    service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
+    def sheet_range(sheet_name: str) -> str:
+        escaped = sheet_name.replace("'", "''")
+        return f"'{escaped}'!A:Z"
 
-def ensure_sheet_tabs(service, spreadsheet_id: str, sheet_names: list[str]) -> None:
-    spreadsheet = (
-        service.spreadsheets()
-        .get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title")
-        .execute()
-    )
+    def quoted_sheet_name(sheet_name: str) -> str:
+        return sheet_range(sheet_name).split("!")[0]
+
+    spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title").execute()
     existing = {
         str(sheet.get("properties", {}).get("title", "")).strip()
         for sheet in spreadsheet.get("sheets", [])
     }
-    missing = [sheet_name for sheet_name in sheet_names if sheet_name not in existing]
-    if not missing:
-        return
+    missing = [sheet_name for sheet_name in [views_sheet_name, post_impact_sheet_name, post_details_sheet_name] if sheet_name not in existing]
+    if missing:
+        requests = [{"addSheet": {"properties": {"title": sheet_name}}} for sheet_name in missing]
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
 
-    requests = [{"addSheet": {"properties": {"title": sheet_name}}} for sheet_name in missing]
-    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+    sheets_payload = [
+        (views_sheet_name, build_views_and_clicks_sheet(merged, month)),
+        (post_impact_sheet_name, build_post_impact_sheet(summary)),
+        (post_details_sheet_name, build_post_details_sheet(events)),
+    ]
+    for sheet_name, rows in sheets_payload:
+        service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=sheet_range(sheet_name),
+        ).execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quoted_sheet_name(sheet_name)}!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values": rows},
+        ).execute()
 
-
-def write_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list[list[object]]) -> None:
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=sheet_name_range(sheet_name),
-    ).execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{quoted_sheet_name(sheet_name)}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": rows},
-    ).execute()
-
-
-def build_views_and_clicks_sheet(merged: pd.DataFrame, month: str | None) -> list[list[object]]:
-    sheet = merged.copy()
-    sheet["date"] = pd.to_datetime(sheet["date"]).dt.strftime("%Y-%m-%d")
-    month_series = pd.to_datetime(sheet["date"]).dt.strftime("%Y-%m")
-    if "month" not in sheet.columns:
-        sheet["month"] = month_series
-    else:
-        sheet["month"] = sheet["month"].fillna(month_series)
-
-    if "users" not in sheet.columns:
-        sheet["users"] = ""
-    sheet["posts"] = sheet["news_posts_count"].fillna(0).astype(int)
-    sheet["notes"] = ""
-
-    if month is not None:
-        sheet["month"] = month
-
-    output = sheet.rename(
-        columns={
-            "date": "Date",
-            "month": "Month",
-            "school": "School",
-            "views": "Views",
-            "clicks": "Clicks",
-            "users": "Users",
-            "posts": "Posts",
-            "notes": "Notes",
-        }
+    print(
+        f"Uploaded {views_sheet_name}, {post_impact_sheet_name}, and {post_details_sheet_name} "
+        f"to spreadsheet {spreadsheet_id}"
     )
-    output = output.sort_values(["School", "Date"])
-    columns = ["Date", "Month", "School", "Views", "Clicks", "Users", "Posts", "Notes"]
-    return [columns] + output[columns].fillna("").values.tolist()
-
-
-def build_post_impact_sheet(summary: pd.DataFrame) -> list[list[object]]:
-    output = summary.copy().sort_values(["school"])
-    if "month" in output.columns:
-        columns = [col for col in output.columns if col != "month"] + ["month"]
-    else:
-        columns = list(output.columns)
-    headers = [
-        str(column).replace("_", " ").title() if column != "month" else "Month"
-        for column in columns
-    ]
-    return [headers] + output[columns].fillna("").values.tolist()
-
-
-def build_post_details_sheet(events: pd.DataFrame) -> list[list[object]]:
-    output = events.copy()
-    sort_columns = [col for col in ["school", "post_date", "post_title"] if col in output.columns]
-    if sort_columns:
-        output = output.sort_values(sort_columns)
-    if "month" in output.columns:
-        columns = [col for col in output.columns if col != "month"] + ["month"]
-    else:
-        columns = list(output.columns)
-    headers = [
-        str(column).replace("_", " ").title() if column != "month" else "Month"
-        for column in columns
-    ]
-    return [headers] + output[columns].fillna("").values.tolist()
+    return True
 
 
 def write_outputs(
     output_dir: Path,
-    merged: pd.DataFrame,
-    summary: pd.DataFrame,
-    events: pd.DataFrame,
+    merged: list[dict[str, Any]],
+    summary: list[dict[str, Any]],
+    events: list[dict[str, Any]],
     run_stamp: str,
     spreadsheet_id: str | None = None,
     service_account_file: Path | None = None,
@@ -607,22 +662,6 @@ def write_outputs(
     post_details_sheet_name: str = DEFAULT_POST_DETAILS_SHEET_NAME,
     month: str | None = None,
 ) -> None:
-    numeric_merged_columns = ["views"]
-    for column in numeric_merged_columns:
-        if column in merged.columns and pd.api.types.is_numeric_dtype(merged[column]):
-            if pd.api.types.is_float_dtype(merged[column]):
-                merged[column] = merged[column].round(2)
-
-    for column in [
-        "views_on_post_day",
-        "avg_views_3_days_before",
-        "avg_views_3_days_after",
-        "view_change_after_post",
-        "view_change_after_post_pct",
-    ]:
-        if column in events.columns:
-            events[column] = pd.to_numeric(events[column], errors="coerce").round(2)
-
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = output_dir / "looker_studio_dataset.csv"
     dataset_dated_path = output_dir / f"looker_studio_dataset_{run_stamp}.csv"
@@ -633,14 +672,84 @@ def write_outputs(
     summary_dated_path = output_dir / f"news_views_school_summary_{run_stamp}.csv"
     events_dated_path = output_dir / f"news_post_event_impact_{run_stamp}.csv"
 
-    merged.to_csv(dataset_path, index=False)
-    merged.to_csv(dataset_dated_path, index=False)
-    merged.to_csv(merged_path, index=False)
-    summary.to_csv(summary_path, index=False)
-    events.to_csv(events_path, index=False)
-    merged.to_csv(merged_dated_path, index=False)
-    summary.to_csv(summary_dated_path, index=False)
-    events.to_csv(events_dated_path, index=False)
+    merged_columns = [
+        "school",
+        "date",
+        "views",
+        "users",
+        "clicks",
+        "impressions",
+        "ctr",
+        "position",
+        "news_posts_count",
+        "last_post_date",
+        "days_since_last_post",
+        "within_1_day_post",
+        "within_3_days_post",
+        "within_7_days_post",
+        "is_post_day",
+        "month",
+    ]
+    if merged and "month" not in merged[0]:
+        merged_columns = [column for column in merged_columns if column != "month"]
+
+    summary_columns = [
+        "school",
+        "total_posts",
+        "no_news_posts_in_period",
+        "avg_views_all_days",
+        "avg_views_on_post_days",
+        "avg_views_within_1_day",
+        "avg_views_within_3_days",
+        "avg_views_within_7_days",
+        "avg_views_no_recent_post",
+        "view_lift_on_post_days_pct",
+        "view_lift_within_1_day_pct",
+        "view_lift_within_3_days_pct",
+        "view_lift_within_7_days_pct",
+        "month",
+    ]
+    if summary and "month" not in summary[0]:
+        summary_columns = [column for column in summary_columns if column != "month"]
+
+    events_columns = [
+        "school",
+        "post_date",
+        "post_title",
+        "post_url",
+        "views_on_post_day",
+        "avg_views_3_days_before",
+        "avg_views_3_days_after",
+        "view_change_after_post",
+        "view_change_after_post_pct",
+        "views_increased_after_post",
+        "month",
+    ]
+    if events and "month" not in events[0]:
+        events_columns = [column for column in events_columns if column != "month"]
+
+    if merged:
+        write_csv(dataset_path, merged, merged_columns)
+        write_csv(dataset_dated_path, merged, merged_columns)
+        write_csv(merged_path, merged, merged_columns)
+        write_csv(merged_dated_path, merged, merged_columns)
+    else:
+        for path in [dataset_path, dataset_dated_path, merged_path, merged_dated_path]:
+            write_csv(path, [], merged_columns)
+
+    if summary:
+        write_csv(summary_path, summary, summary_columns)
+        write_csv(summary_dated_path, summary, summary_columns)
+    else:
+        for path in [summary_path, summary_dated_path]:
+            write_csv(path, [], summary_columns)
+
+    if events:
+        write_csv(events_path, events, events_columns)
+        write_csv(events_dated_path, events, events_columns)
+    else:
+        for path in [events_path, events_dated_path]:
+            write_csv(path, [], events_columns)
 
     print(f"Wrote {dataset_path}")
     print(f"Wrote {dataset_dated_path}")
@@ -652,34 +761,19 @@ def write_outputs(
     print(f"Wrote {events_dated_path}")
 
     if spreadsheet_id:
-        sheets_service = load_sheets_service(service_account_file or DEFAULT_SERVICE_ACCOUNT_FILE)
-        ensure_sheet_tabs(
-            sheets_service,
+        uploaded = maybe_upload_to_sheets(
             spreadsheet_id,
-            [views_sheet_name, post_impact_sheet_name, post_details_sheet_name],
-        )
-        write_sheet(
-            sheets_service,
-            spreadsheet_id,
+            service_account_file or DEFAULT_SERVICE_ACCOUNT_FILE,
             views_sheet_name,
-            build_views_and_clicks_sheet(merged, month),
-        )
-        write_sheet(
-            sheets_service,
-            spreadsheet_id,
             post_impact_sheet_name,
-            build_post_impact_sheet(summary),
-        )
-        write_sheet(
-            sheets_service,
-            spreadsheet_id,
             post_details_sheet_name,
-            build_post_details_sheet(events),
+            merged,
+            summary,
+            events,
+            month,
         )
-        print(
-            f"Uploaded {views_sheet_name}, {post_impact_sheet_name}, and {post_details_sheet_name} "
-            f"to spreadsheet {spreadsheet_id}"
-        )
+        if not uploaded:
+            warn("Spreadsheet upload skipped.")
 
 
 def main() -> int:
@@ -693,27 +787,45 @@ def main() -> int:
         ga4 = prepare_ga4(ga4_raw, month_start, month_end)
         rss = prepare_rss(rss_raw, month_start, month_end)
 
-        if ga4.empty:
+        if not ga4:
             warn("GA4 data is empty after filtering.")
-        if rss.empty:
+        if not rss:
             warn("RSS data is empty after filtering.")
 
         warn_school_mismatches(ga4, rss)
 
         news_daily = build_news_daily_summary(rss)
-        merged = ga4.merge(news_daily, on=["school", "date"], how="left")
-        merged["news_posts_count"] = merged["news_posts_count"].fillna(0)
-        merged = add_rolling_post_flags(merged, news_daily)
+        news_daily_lookup = {(row["school"], row["date"]): row["news_posts_count"] for row in news_daily}
 
+        merged: list[dict[str, Any]] = []
+        for row in ga4:
+            merged.append(
+                {
+                    "school": row["school"],
+                    "date": row["date"],
+                    "views": row["views"],
+                    "users": row.get("users"),
+                    "clicks": row.get("clicks"),
+                    "impressions": row.get("impressions"),
+                    "ctr": row.get("ctr"),
+                    "position": row.get("position"),
+                    "news_posts_count": news_daily_lookup.get((row["school"], row["date"]), 0),
+                }
+            )
+
+        merged = add_rolling_post_flags(merged, news_daily)
         summary = build_school_summary(merged)
         events = build_event_impact(rss, merged)
 
         if run_label is not None:
-            merged["month"] = pd.to_datetime(merged["date"]).dt.strftime("%Y-%m")
-            summary["month"] = run_label
-            events["month"] = run_label
+            for row in merged:
+                row["month"] = run_label
+            for row in summary:
+                row["month"] = run_label
+            for row in events:
+                row["month"] = run_label
 
-        run_stamp = run_label or pd.Timestamp.today().strftime("%Y-%m-%d")
+        run_stamp = run_label or date.today().strftime("%Y-%m-%d")
         write_outputs(
             args.output_dir,
             merged,
