@@ -31,7 +31,8 @@ PROPERTY_MAP_FILE="${GA4_PROPERTY_MAP:-$SCRIPT_DIR/ga4-reporting/property_ids.ts
 AUTH_CODE="${GA4_AUTH_CODE:-}"
 AUTH_MODE="${GA4_AUTH_MODE:-oauth}"
 SERVICE_ACCOUNT_FILE="${GA4_SERVICE_ACCOUNT_FILE:-$SCRIPT_DIR/ga4-reporting/keys/service-account.json}"
-CLIENT_SECRET_FILE="${GA4_CLIENT_SECRET_FILE:-}"
+CLIENT_SECRET_FILE="${GA4_CLIENT_SECRET_FILE:-$SCRIPT_DIR/ga4-reporting/keys/client_secret_463400512765-k9faff977lqifvpiqt69263r8c9dnr6e.apps.googleusercontent.com.json}"
+GSC_TOKEN_FILE="${GA4_GSC_TOKEN_FILE:-$SCRIPT_DIR/ga4-reporting/keys/gsc_oauth_token.json}"
 DRY_RUN=0
 MONTH=""
 START_DATE=""
@@ -276,6 +277,9 @@ if [ -z "$START_DATE" ] || [ -z "$END_DATE" ]; then
   exit 1
 fi
 
+GA4_OUTPUT_STAMP="$(date +%Y%m%d_%H%M%S)"
+GA4_OUTPUT="$SCRIPT_DIR/imports/ga4_daily_${GA4_OUTPUT_STAMP}.csv"
+
 if [ ! -f "$PROPERTY_MAP_FILE" ]; then
   echo "error: property map not found at $PROPERTY_MAP_FILE" >&2
   echo "expected columns: school, ga4_property_id, search_console_property" >&2
@@ -291,8 +295,10 @@ if [ "$DRY_RUN" -eq 0 ]; then
       exit 1
     fi
   elif [ "$AUTH_MODE" = "oauth" ]; then
-    CLIENT_SECRET_FILE="$(resolve_client_secret_file || true)"
-    if [ -z "$CLIENT_SECRET_FILE" ]; then
+    if [ ! -f "$CLIENT_SECRET_FILE" ]; then
+      CLIENT_SECRET_FILE="$(resolve_client_secret_file || true)"
+    fi
+    if [ -z "$CLIENT_SECRET_FILE" ] || [ ! -f "$CLIENT_SECRET_FILE" ]; then
       echo "error: no OAuth client secret JSON found in ga4-reporting/keys" >&2
       echo "expected client_secret_*.json or set GA4_CLIENT_SECRET_FILE" >&2
       exit 1
@@ -309,20 +315,18 @@ fi
 
 if [ "$DRY_RUN" -eq 0 ] && has_runtime_deps; then
   GA4_CMD=(
-    "$PYTHON_BIN"
-    "$SCRIPT_DIR/test_ga4.py"
-    --property-map "$PROPERTY_MAP_FILE"
-    --start-date "$START_DATE"
-    --end-date "$END_DATE"
-    --output "$SCRIPT_DIR/imports/ga4_daily.csv"
-    --token-file "$SCRIPT_DIR/ga4-reporting/keys/oauth_token.json"
-    --service-account-file "$SERVICE_ACCOUNT_FILE"
-    --auth-mode "$AUTH_MODE"
-  )
-
-  if [ "$AUTH_MODE" = "oauth" ]; then
-    GA4_CMD+=(--client-secret "$CLIENT_SECRET_FILE")
-  fi
+  "$PYTHON_BIN"
+  "$SCRIPT_DIR/test_ga4.py"
+  --property-map "$PROPERTY_MAP_FILE"
+  --start-date "$START_DATE"
+  --end-date "$END_DATE"
+  --output "$GA4_OUTPUT"
+  --client-secret "$CLIENT_SECRET_FILE"
+  --token-file "$SCRIPT_DIR/ga4-reporting/keys/oauth_token.json"
+  --gsc-token-file "$GSC_TOKEN_FILE"
+  --service-account-file "$SERVICE_ACCOUNT_FILE"
+  --auth-mode "$AUTH_MODE"
+)
 
   if [ -n "$AUTH_CODE" ]; then
     GA4_CMD+=(--auth-code "$AUTH_CODE")
@@ -337,11 +341,13 @@ else
   fi
 fi
 
-GA4_INPUT="$SCRIPT_DIR/imports/ga4_daily.csv"
+GA4_INPUT="$GA4_OUTPUT"
 
 if [ ! -f "$GA4_INPUT" ] || [ ! -s "$GA4_INPUT" ]; then
   GA4_INPUT="$SCRIPT_DIR/data/ga4_daily.csv"
 fi
+
+echo "Using GA4 export: $GA4_INPUT" >&2
 
 REPORT_CMD=(
   "$SCRIPT_DIR/run_news_views.sh"

@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Iterable
 
 from google.api_core.exceptions import GoogleAPIError
@@ -28,6 +30,7 @@ DEFAULT_OUTPUT = Path("imports/ga4_daily.csv")
 DEFAULT_KEYS_DIR = Path("ga4-reporting/keys")
 DEFAULT_CLIENT_SECRET = DEFAULT_KEYS_DIR / "client_secret_463400512765-k9faff977lqifvpiqt69263r8c9dnr6e.apps.googleusercontent.com.json"
 DEFAULT_TOKEN_FILE = DEFAULT_KEYS_DIR / "oauth_token.json"
+DEFAULT_GSC_TOKEN_FILE = DEFAULT_KEYS_DIR / "gsc_oauth_token.json"
 DEFAULT_SERVICE_ACCOUNT_FILE = DEFAULT_KEYS_DIR / "service-account.json"
 DEFAULT_PROPERTY_MAP = Path("ga4-reporting/property_ids.tsv")
 SCOPES = [
@@ -35,11 +38,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/webmasters.readonly",
 ]
 AUTH_MODES = {"oauth", "service-account"}
+DEBUG_GSC = os.getenv("GA4_DEBUG_GSC", "0") == "1"
+IGNORE_GSC_DATE_RANGE = os.getenv("GA4_IGNORE_GSC_DATE_RANGE", "1") == "1"
+SEARCH_CONSOLE_TYPES = ["web", "discover", "googleNews", "news", "image", "video"]
 SEARCH_CONSOLE_SITE_ALIASES = {
-    "EMPS": ["https://schools.edu.ky/emmps/", "https://schools.edu.ky/emps/"],
+    "EMPS": ["https://schools.edu.ky/emmps/"],
     "LHSS": ["https://schools.edu.ky/lhs/", "https://schools.edu.ky/lshs/"],
-    "SBPS": ["https://schools.edu.ky/csbs/", "https://schools.edu.ky/sbps/"],
-    "PPPS": ["https://schools.edu.ky/pps/", "https://schools.edu.ky/ppps/"],
+    "SBPS": ["https://schools.edu.ky/csbs/"],
+    "PPPS": ["https://schools.edu.ky/pps/"],
 }
 
 
@@ -58,9 +64,13 @@ class Args:
     output: Path
     client_secret: Path
     token_file: Path
+    gsc_token_file: Path
     service_account_file: Path
     auth_mode: str
     auth_code: str | None
+    gsc_only: bool
+    gsc_site_url: str | None
+    gsc_search_type: str
 
 
 def parse_args() -> Args:
@@ -92,6 +102,12 @@ def parse_args() -> Args:
         help="OAuth token cache JSON path.",
     )
     parser.add_argument(
+        "--gsc-token-file",
+        type=Path,
+        default=DEFAULT_GSC_TOKEN_FILE,
+        help="OAuth token cache JSON path used for Search Console.",
+    )
+    parser.add_argument(
         "--service-account-file",
         type=Path,
         default=DEFAULT_SERVICE_ACCOUNT_FILE,
@@ -109,6 +125,23 @@ def parse_args() -> Args:
         default=None,
         help="Authorization code returned by the Google consent screen.",
     )
+    parser.add_argument(
+        "--gsc-only",
+        action="store_true",
+        help="Only probe Search Console clicks for a single property and exit.",
+    )
+    parser.add_argument(
+        "--gsc-site-url",
+        type=str,
+        default=None,
+        help="Search Console site URL for --gsc-only mode.",
+    )
+    parser.add_argument(
+        "--gsc-search-type",
+        type=str,
+        default="web",
+        help="Search Console search type for --gsc-only mode.",
+    )
 
     parsed = parser.parse_args()
     today = date.today()
@@ -120,16 +153,17 @@ def parse_args() -> Args:
         output=parsed.output,
         client_secret=parsed.client_secret,
         token_file=parsed.token_file,
+        gsc_token_file=parsed.gsc_token_file,
         service_account_file=parsed.service_account_file,
         auth_mode=parsed.auth_mode,
         auth_code=parsed.auth_code,
+        gsc_only=parsed.gsc_only,
+        gsc_site_url=parsed.gsc_site_url,
+        gsc_search_type=parsed.gsc_search_type,
     )
 
 
 def load_oauth_credentials(client_secret_path: Path, token_file_path: Path, auth_code: str | None = None) -> Credentials:
-    if not client_secret_path.exists():
-        raise FileNotFoundError(f"OAuth client secret file not found: {client_secret_path}")
-
     creds = None
     if token_file_path.exists():
         creds = Credentials.from_authorized_user_file(token_file_path, SCOPES)
@@ -138,6 +172,8 @@ def load_oauth_credentials(client_secret_path: Path, token_file_path: Path, auth
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            if not client_secret_path.exists():
+                raise FileNotFoundError(f"OAuth client secret file not found: {client_secret_path}")
             flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
             flow.redirect_uri = "http://localhost"
             auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
@@ -259,8 +295,199 @@ def load_ga4_client(credentials: Credentials) -> BetaAnalyticsDataClient:
     return BetaAnalyticsDataClient(credentials=credentials)
 
 
+def load_search_console_credentials(
+    client_secret_path: Path,
+    token_file_path: Path,
+    auth_code: str | None = None,
+) -> Credentials:
+    credential_path = client_secret_path
+    print(f"Using GSC OAuth credentials: {credential_path}", file=sys.stderr)
+    return load_oauth_credentials(client_secret_path, token_file_path, auth_code)
+
+
 def load_search_console_client(credentials: Credentials):
     return build("searchconsole", "v1", credentials=credentials, cache_discovery=False)
+
+
+def load_search_console_sites(client) -> set[str]:
+    try:
+        sites_resource = client.sites()
+    except Exception:
+        return set()
+
+    try:
+        response = sites_resource.list().execute()
+    except Exception as exc:
+        print(f"warning: unable to list Search Console sites: {exc}", file=sys.stderr)
+        return set()
+
+    sites: set[str] = set()
+    for entry in response.get("siteEntry", []):
+        site_url = str(entry.get("siteUrl", "")).strip()
+        if site_url:
+            sites.add(site_url)
+    if sites:
+        print(f"Search Console accessible sites: {sorted(sites)}", file=sys.stderr)
+    return sites
+
+
+def debug_print_gsc_rows(label: str, site_url: str, rows: list[dict[str, str]]) -> None:
+    if not DEBUG_GSC:
+        return
+    print(f"GSC DEBUG {label} siteUrl={site_url} rows={len(rows)}", file=sys.stderr)
+    for row in rows[:10]:
+        print(f"GSC DEBUG {label} row={row}", file=sys.stderr)
+
+
+def iter_search_console_rows_for_type(
+    client,
+    site_url: str | None,
+    start_date: str,
+    end_date: str,
+    search_type: str,
+    page_filter: str | None = None,
+    dimensions: list[str] | None = None,
+) -> Iterable[dict[str, str]]:
+    if not site_url:
+        return []
+
+    if IGNORE_GSC_DATE_RANGE:
+        start_date = "2000-01-01"
+        end_date = date.today().isoformat()
+
+    request_body = {
+        "startDate": start_date,
+        "endDate": end_date,
+        "dimensions": dimensions or ["date"],
+        "rowLimit": 25000,
+        "type": search_type,
+    }
+    if page_filter:
+        request_body["dimensionFilterGroups"] = [
+            {
+                "filters": [
+                    {
+                        "dimension": "page",
+                        "operator": "contains",
+                        "expression": page_filter,
+                    }
+                ]
+            }
+        ]
+    response = client.searchanalytics().query(siteUrl=site_url, body=request_body).execute()
+    for row in response.get("rows", []):
+        keys = row.get("keys", [])
+        if not keys:
+            continue
+        try:
+            day = datetime.strptime(keys[0], "%Y%m%d").date().isoformat()
+        except ValueError:
+            continue
+        yield {
+            "date": day,
+            "page": row.get("keys", [None, None])[1] if len(row.get("keys", [])) > 1 else "",
+            "clicks": row.get("clicks", 0),
+            "impressions": row.get("impressions", 0),
+            "ctr": row.get("ctr", 0),
+            "position": row.get("position", 0),
+        }
+
+
+def read_search_console_clicks_only(
+    client,
+    site_url: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    search_type: str = "web",
+) -> list[dict[str, str]]:
+    if start_date is None or end_date is None:
+        start_date = "2000-01-01"
+        end_date = date.today().isoformat()
+    rows = list(
+        iter_search_console_rows_for_type(
+            client,
+            site_url,
+            start_date,
+            end_date,
+            search_type=search_type,
+        )
+    )
+    total_clicks = sum(float(row.get("clicks", 0) or 0) for row in rows)
+    print(
+        json.dumps(
+            {
+                "site_url": site_url,
+                "search_type": search_type,
+                "start_date": start_date,
+                "end_date": end_date,
+                "rows": len(rows),
+                "clicks": total_clicks,
+            }
+        ),
+        file=sys.stderr,
+    )
+    return rows
+
+
+def iter_search_console_site_candidates(site_url: str | None, school: str) -> list[str]:
+    candidates: list[str] = []
+    if site_url:
+        normalized = site_url.strip()
+        if normalized:
+            candidates.append(normalized)
+            if normalized.endswith("/"):
+                trimmed = normalized.rstrip("/")
+                if trimmed:
+                    candidates.append(trimmed)
+            else:
+                candidates.append(f"{normalized}/")
+    candidates.extend(SEARCH_CONSOLE_SITE_ALIASES.get(school, []))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    return deduped
+
+
+def derive_page_filter(site_url: str | None) -> str | None:
+    if not site_url:
+        return None
+    parsed = urlparse(site_url.strip())
+    path = parsed.path.strip()
+    if not path or path == "/":
+        return None
+    return path.lower().rstrip("/")
+
+
+def build_page_matchers(site_url: str | None, school: str) -> list[str]:
+    matchers: list[str] = []
+    page_filter = derive_page_filter(site_url)
+    if page_filter:
+        base = page_filter.lstrip("/")
+        variants = {
+            page_filter,
+            f"/{base.lower()}",
+            f"/{base.upper()}",
+        }
+        matchers.extend(sorted(variants))
+
+    school_aliases = {
+        "CHHS": ["chhs"],
+        "EMPS": ["emmps", "emps"],
+        "PPPS": ["pps", "ppps"],
+        "SBPS": ["csbs", "sbps"],
+        "LHSS": ["lhs", "lshs"],
+    }.get(school, [])
+    for alias in school_aliases:
+        for candidate in (alias.lower(), alias.upper()):
+            matcher = f"/{candidate}"
+            if matcher not in matchers:
+                matchers.append(matcher)
+    return matchers
 
 
 def iter_ga4_rows(
@@ -299,32 +526,18 @@ def iter_search_console_rows(
     site_url: str | None,
     start_date: str,
     end_date: str,
+    page_filter: str | None = None,
+    dimensions: list[str] | None = None,
 ) -> Iterable[dict[str, str]]:
-    if not site_url:
-        return []
-
-    request_body = {
-        "startDate": start_date,
-        "endDate": end_date,
-        "dimensions": ["date"],
-        "rowLimit": 25000,
-    }
-    response = client.searchanalytics().query(siteUrl=site_url, body=request_body).execute()
-    for row in response.get("rows", []):
-        keys = row.get("keys", [])
-        if not keys:
-            continue
-        try:
-            day = datetime.strptime(keys[0], "%Y%m%d").date().isoformat()
-        except ValueError:
-            continue
-        yield {
-            "date": day,
-            "clicks": row.get("clicks", 0),
-            "impressions": row.get("impressions", 0),
-            "ctr": row.get("ctr", 0),
-            "position": row.get("position", 0),
-        }
+    yield from iter_search_console_rows_for_type(
+        client,
+        site_url,
+        start_date,
+        end_date,
+        search_type="web",
+        page_filter=page_filter,
+        dimensions=dimensions,
+    )
 
 
 def iter_search_console_rows_with_fallback(
@@ -334,25 +547,89 @@ def iter_search_console_rows_with_fallback(
     start_date: str,
     end_date: str,
 ) -> Iterable[dict[str, str]]:
-    candidates: list[str] = []
-    if site_url:
-        candidates.append(site_url)
-    candidates.extend(SEARCH_CONSOLE_SITE_ALIASES.get(school, []))
-
-    seen: set[str] = set()
     last_exc: Exception | None = None
+    page_filter = derive_page_filter(site_url)
+    accessible_sites = load_search_console_sites(client)
 
-    for candidate in candidates:
-        normalized = candidate.strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        try:
-            yield from iter_search_console_rows(client, normalized, start_date, end_date)
-            return
-        except (GoogleAPIError, HttpError) as exc:
-            last_exc = exc
-            continue
+    for candidate in iter_search_console_site_candidates(site_url, school):
+        for search_type in SEARCH_CONSOLE_TYPES:
+            try:
+                rows = list(iter_search_console_rows_for_type(client, candidate, start_date, end_date, search_type))
+            except (GoogleAPIError, HttpError) as exc:
+                last_exc = exc
+                continue
+            debug_print_gsc_rows(f"{school} candidate type={search_type}", candidate, rows)
+            if rows:
+                total_clicks = sum(float(row.get("clicks", 0) or 0) for row in rows)
+                if total_clicks > 0 or not page_filter:
+                    yield from rows
+                    return
+                print(
+                    f"warning: GSC candidate {candidate} type={search_type} returned rows but zero clicks for {school}; trying fallback",
+                    file=sys.stderr,
+                )
+                continue
+
+    if page_filter:
+        root_candidates = [
+            candidate
+            for candidate in ("sc-domain:schools.edu.ky", "https://schools.edu.ky/")
+            if not accessible_sites or candidate in accessible_sites
+        ]
+        if not root_candidates:
+            root_candidates = ["https://schools.edu.ky/"]
+
+        for root_site_url in root_candidates:
+            for search_type in SEARCH_CONSOLE_TYPES:
+                try:
+                    rows = list(
+                        iter_search_console_rows_for_type(
+                            client,
+                            root_site_url,
+                            start_date,
+                            end_date,
+                            search_type,
+                            dimensions=["date", "page"],
+                        )
+                    )
+                except (GoogleAPIError, HttpError) as exc:
+                    last_exc = exc
+                    continue
+                debug_print_gsc_rows(f"{school} root type={search_type}", root_site_url, rows)
+
+                matchers = build_page_matchers(site_url, school)
+                filtered_rows = [
+                    row
+                    for row in rows
+                    if any(matcher.lower() in str(row.get("page", "")).lower() for matcher in matchers)
+                ]
+                if filtered_rows:
+                    print(
+                        f"Using GSC root fallback for {school}: siteUrl={root_site_url} type={search_type} matched pages {matchers}",
+                        file=sys.stderr,
+                    )
+                    if DEBUG_GSC:
+                        print(f"GSC DEBUG {school} matchers={matchers}", file=sys.stderr)
+                    by_day: dict[str, dict[str, float | int | str]] = defaultdict(
+                        lambda: {"date": "", "clicks": 0, "impressions": 0}
+                    )
+                    for row in filtered_rows:
+                        day = str(row.get("date", "")).strip()
+                        if not day:
+                            continue
+                        bucket = by_day[day]
+                        bucket["date"] = day
+                        bucket["clicks"] = int(float(bucket["clicks"])) + int(float(row.get("clicks", 0) or 0))
+                        bucket["impressions"] = int(float(bucket["impressions"])) + int(float(row.get("impressions", 0) or 0))
+                    for row in sorted(by_day.values(), key=lambda item: item["date"]):
+                        yield {
+                            "date": row["date"],
+                            "clicks": row["clicks"],
+                            "impressions": row["impressions"],
+                            "ctr": "",
+                            "position": "",
+                        }
+                    return
 
     if last_exc is not None:
         raise last_exc
@@ -445,6 +722,24 @@ def write_archive_copy(path: Path, rows: list[dict[str, object]], start_date: st
 
 def main() -> int:
     args = parse_args()
+    if getattr(args, "gsc_only", False):
+        if not args.gsc_site_url:
+            raise ValueError("--gsc-site-url is required with --gsc-only")
+        search_console_credentials = load_search_console_credentials(
+            args.client_secret,
+            args.gsc_token_file,
+            args.auth_code,
+        )
+        search_console_client = load_search_console_client(search_console_credentials)
+        rows = read_search_console_clicks_only(
+            search_console_client,
+            args.gsc_site_url,
+            None,
+            None,
+            args.gsc_search_type,
+        )
+        print(json.dumps(rows, indent=2))
+        return 0
     credentials = load_credentials(
         args.client_secret,
         args.token_file,
@@ -453,7 +748,12 @@ def main() -> int:
         args.auth_code,
     )
     ga4_client = load_ga4_client(credentials)
-    search_console_client = load_search_console_client(credentials)
+    search_console_credentials = load_search_console_credentials(
+        args.client_secret,
+        args.gsc_token_file,
+        args.auth_code,
+    )
+    search_console_client = load_search_console_client(search_console_credentials)
     property_map = load_property_map(args.property_map)
     rows = build_daily_rows(ga4_client, search_console_client, property_map, args.start_date, args.end_date)
     write_csv(args.output, rows)
