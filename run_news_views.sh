@@ -16,7 +16,6 @@ SCRIPT_DIR="$SOURCE_DIR"
 VENV_DIR="$SCRIPT_DIR/.venv"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DEFAULT_GA4="$SCRIPT_DIR/data/ga4_daily.csv"
-DEFAULT_RSS="$SCRIPT_DIR/data/rss_posts.csv"
 DEFAULT_SPREADSHEET_ID="109tHI2m1olk6oXMZbV_OOneUT7apMbRJCQkYxXldA1I"
 DEFAULT_SERVICE_ACCOUNT_FILE="$SCRIPT_DIR/ga4-reporting/keys/service-account.json"
 DEFAULT_VIEWS_SHEET_NAME="Views and Clicks"
@@ -24,7 +23,6 @@ DEFAULT_POST_IMPACT_SHEET_NAME="Post Impact"
 DEFAULT_POST_DETAILS_SHEET_NAME="Post Details"
 IMPORTS_DIR="$SCRIPT_DIR/imports"
 IMPORTS_GA4="$IMPORTS_DIR/ga4_daily.csv"
-IMPORTS_RSS="$IMPORTS_DIR/rss_posts.csv"
 MIN_GA4_DATA_ROWS=10
 MIN_GA4_DISTINCT_SCHOOLS=5
 
@@ -107,8 +105,6 @@ for search_root in candidate_roots:
   for path in search_root.rglob("*.csv"):
     if any(part in excluded_parts for part in path.parts):
         continue
-    if path.name.startswith("news_posts_dated_"):
-        continue
     try:
         if path.stat().st_size == 0:
             continue
@@ -129,52 +125,11 @@ if best_path:
 PY
 }
 
-latest_news_posts_csv() {
-  python3 - "$SCRIPT_DIR" <<'PY'
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-imports_dir = root / "imports"
-best_path = None
-best_mtime = -1.0
-
-candidate_paths = []
-if imports_dir.exists():
-    candidate_paths.append(imports_dir / "rss_posts.csv")
-candidate_paths.extend(sorted(root.glob("news_posts_dated_*.csv")))
-
-for path in candidate_paths:
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            continue
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            header = f.readline().strip().lower()
-            second_line = f.readline()
-        if header not in {"school,ga4 school,title,last date,link", "school,title,last date,link"}:
-            continue
-        if header == "school,ga4 school,title,last date,link" and not second_line:
-            continue
-        if header == "school,title,last date,link" and not second_line:
-            continue
-        mtime = path.stat().st_mtime
-        if mtime > best_mtime:
-            best_mtime = mtime
-            best_path = path
-    except OSError:
-        continue
-
-if best_path:
-    print(best_path)
-PY
-}
-
 if [ -x "$VENV_DIR/bin/python" ]; then
   PYTHON_BIN="$VENV_DIR/bin/python"
 fi
 
 GA4_INPUT="$DEFAULT_GA4"
-RSS_INPUT="$DEFAULT_RSS"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 START_DATE=""
 END_DATE=""
@@ -190,10 +145,6 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --ga4)
       GA4_INPUT="$(resolve_path "${2:-}")"
-      shift 2
-      ;;
-    --rss)
-      RSS_INPUT="$(resolve_path "${2:-}")"
       shift 2
       ;;
     --output-dir)
@@ -281,25 +232,10 @@ fi
 stage_input_csv "$GA4_INPUT" "$IMPORTS_GA4"
 GA4_INPUT="$IMPORTS_GA4"
 
-if ! csv_has_data_rows "$RSS_INPUT"; then
-  AUTO_RSS="$(latest_news_posts_csv || true)"
-  if [ -n "${AUTO_RSS:-}" ]; then
-    RSS_INPUT="$AUTO_RSS"
-    echo "Using latest RSS export: $RSS_INPUT"
-  else
-    echo "error: no dated RSS export (news_posts_dated_*.csv) was found" >&2
-    exit 1
-  fi
-fi
-
-stage_input_csv "$RSS_INPUT" "$IMPORTS_RSS"
-RSS_INPUT="$IMPORTS_RSS"
-
 REPORT_CMD=(
   "$PYTHON_BIN"
   "$SCRIPT_DIR/news_views_impact.py"
   --ga4 "$GA4_INPUT"
-  --rss "$RSS_INPUT"
   --output-dir "$OUTPUT_DIR"
   --spreadsheet-id "$SPREADSHEET_ID"
   --service-account-file "$SERVICE_ACCOUNT_FILE"

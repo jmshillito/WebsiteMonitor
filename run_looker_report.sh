@@ -14,12 +14,24 @@ fi
 
 SCRIPT_DIR="$SOURCE_DIR"
 VENV_DIR="$SCRIPT_DIR/.venv"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+REQUIREMENTS_FILE="$SCRIPT_DIR/requirements.txt"
+PYTHON_BIN_OVERRIDE="${PYTHON_BIN:-}"
+if [ -n "$PYTHON_BIN_OVERRIDE" ]; then
+  PYTHON_BIN="$PYTHON_BIN_OVERRIDE"
+  PYTHON_BIN_SOURCE="override"
+elif [ -x "$VENV_DIR/bin/python" ]; then
+  PYTHON_BIN="$VENV_DIR/bin/python"
+  PYTHON_BIN_SOURCE="venv"
+else
+  PYTHON_BIN="python3"
+  PYTHON_BIN_SOURCE="system"
+fi
 
 PROPERTY_MAP_FILE="${GA4_PROPERTY_MAP:-$SCRIPT_DIR/ga4-reporting/property_ids.tsv}"
 AUTH_CODE="${GA4_AUTH_CODE:-}"
 AUTH_MODE="${GA4_AUTH_MODE:-oauth}"
 SERVICE_ACCOUNT_FILE="${GA4_SERVICE_ACCOUNT_FILE:-$SCRIPT_DIR/ga4-reporting/keys/service-account.json}"
+CLIENT_SECRET_FILE="${GA4_CLIENT_SECRET_FILE:-}"
 DRY_RUN=0
 MONTH=""
 START_DATE=""
@@ -67,14 +79,53 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-has_google_deps() {
-  python3 - <<'PY'
+bootstrap_venv() {
+  if [ "$PYTHON_BIN_SOURCE" = "override" ]; then
+    return 0
+  fi
+
+  if [ -x "$VENV_DIR/bin/python" ]; then
+    PYTHON_BIN="$VENV_DIR/bin/python"
+    if has_runtime_deps; then
+      return 0
+    fi
+    echo "Refreshing .venv dependencies..." >&2
+    if ! "$PYTHON_BIN" -m pip install -r "$REQUIREMENTS_FILE"; then
+      echo "warning: dependency install failed; continuing without required runtime libraries." >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  if [ ! -f "$REQUIREMENTS_FILE" ]; then
+    echo "warning: requirements.txt not found; skipping virtualenv bootstrap." >&2
+    return 1
+  fi
+
+  echo "Bootstrapping .venv and installing Python dependencies..." >&2
+  if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
+    echo "warning: failed to create .venv; continuing without required runtime libraries." >&2
+    return 1
+  fi
+
+  PYTHON_BIN="$VENV_DIR/bin/python"
+  if ! "$PYTHON_BIN" -m pip install -r "$REQUIREMENTS_FILE"; then
+    echo "warning: dependency install failed; continuing without required runtime libraries." >&2
+    return 1
+  fi
+
+  return 0
+}
+
+has_runtime_deps() {
+  "$PYTHON_BIN" - <<'PY'
 import importlib.util
 mods = [
     "google.analytics.data_v1beta",
     "google_auth_oauthlib",
     "googleapiclient.discovery",
     "google.oauth2.service_account",
+    "requests",
 ]
 def exists(mod: str) -> bool:
     try:
@@ -86,39 +137,73 @@ raise SystemExit(0 if all(exists(mod) for mod in mods) else 1)
 PY
 }
 
-latest_common_month_from_csvs() {
-  python3 - "$SCRIPT_DIR/imports/ga4_daily.csv" "$SCRIPT_DIR/imports/rss_posts.csv" <<'PY'
+latest_month_from_csv() {
+  python3 - "$1" <<'PY'
 from pathlib import Path
 import csv
 import sys
 
-ga4_path = Path(sys.argv[1])
-rss_path = Path(sys.argv[2])
-
-def months_from_csv(path: Path, date_field: str) -> set[str]:
-    months: set[str] = set()
-    try:
-        with path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            if date_field not in (reader.fieldnames or []):
-                return months
-            for row in reader:
-                value = str(row.get(date_field, "")).strip()
-                if len(value) >= 7:
-                    months.add(value[:7])
-    except OSError:
-        return months
-    return months
-
-ga4_months = months_from_csv(ga4_path, "date")
-rss_months = months_from_csv(rss_path, "last date")
-common = sorted(ga4_months & rss_months)
-
-if not common:
+path = Path(sys.argv[1])
+months: set[str] = set()
+try:
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if "date" not in (reader.fieldnames or []):
+            raise SystemExit(1)
+        for row in reader:
+            value = str(row.get("date", "")).strip()
+            if len(value) >= 7:
+                months.add(value[:7])
+except OSError:
     raise SystemExit(1)
 
-print(common[-1])
+if not months:
+    raise SystemExit(1)
+
+print(sorted(months)[-1])
 PY
+}
+
+resolve_client_secret_file() {
+  if [ -n "$CLIENT_SECRET_FILE" ]; then
+    printf '%s\n' "$CLIENT_SECRET_FILE"
+    return 0
+  fi
+
+  local default_secret="$SCRIPT_DIR/ga4-reporting/keys/client_secret_463400512765-k9faff977lqifvpiqt69263r8c9dnr6e.apps.googleusercontent.com.json"
+  if [ -f "$default_secret" ]; then
+    printf '%s\n' "$default_secret"
+    return 0
+  fi
+
+  local candidate
+  for candidate in "$SCRIPT_DIR"/ga4-reporting/keys/*.json; do
+    [ -f "$candidate" ] || continue
+    case "$candidate" in
+      *oauth_token.json|*service-account.json)
+        continue
+        ;;
+    esac
+    printf '%s\n' "$candidate"
+    return 0
+  done
+
+  return 1
+}
+
+resolve_service_account_file() {
+  if [ -n "$SERVICE_ACCOUNT_FILE" ]; then
+    printf '%s\n' "$SERVICE_ACCOUNT_FILE"
+    return 0
+  fi
+
+  local default_service_account="$SCRIPT_DIR/ga4-reporting/keys/service-account.json"
+  if [ -f "$default_service_account" ]; then
+    printf '%s\n' "$default_service_account"
+    return 0
+  fi
+
+  return 1
 }
 
 month_to_range() {
@@ -159,9 +244,9 @@ if [ -z "$MONTH" ] && [ -z "$START_DATE" ] && [ -z "$END_DATE" ]; then
       MONTH="$START_MONTH"
     fi
   elif [ "$DRY_RUN" -eq 1 ]; then
-    MONTH="$(latest_common_month_from_csvs || true)"
+    MONTH="$(latest_month_from_csv "$GA4_INPUT" || true)"
     if [ -z "$MONTH" ]; then
-      echo "error: no common month exists in imports/ga4_daily.csv and imports/rss_posts.csv" >&2
+      echo "error: no month exists in $GA4_INPUT" >&2
       exit 1
     fi
     read -r START_DATE END_DATE < <(month_to_range "$MONTH")
@@ -197,9 +282,32 @@ if [ ! -f "$PROPERTY_MAP_FILE" ]; then
   exit 1
 fi
 
-if [ "$DRY_RUN" -eq 0 ] && has_google_deps; then
-  "$PYTHON_BIN" "$SCRIPT_DIR/school_news_feed.py" --csv-output "$SCRIPT_DIR/imports/rss_posts.csv"
+if [ "$DRY_RUN" -eq 0 ]; then
+  if [ "$AUTH_MODE" = "service-account" ]; then
+    SERVICE_ACCOUNT_FILE="$(resolve_service_account_file || true)"
+    if [ -z "$SERVICE_ACCOUNT_FILE" ]; then
+      echo "error: no service account JSON found in ga4-reporting/keys" >&2
+      echo "expected service-account.json or set GA4_SERVICE_ACCOUNT_FILE" >&2
+      exit 1
+    fi
+  elif [ "$AUTH_MODE" = "oauth" ]; then
+    CLIENT_SECRET_FILE="$(resolve_client_secret_file || true)"
+    if [ -z "$CLIENT_SECRET_FILE" ]; then
+      echo "error: no OAuth client secret JSON found in ga4-reporting/keys" >&2
+      echo "expected client_secret_*.json or set GA4_CLIENT_SECRET_FILE" >&2
+      exit 1
+    fi
+  else
+    echo "error: unsupported GA4 auth mode: $AUTH_MODE" >&2
+    exit 1
+  fi
+fi
 
+if [ "$DRY_RUN" -eq 0 ]; then
+  bootstrap_venv || true
+fi
+
+if [ "$DRY_RUN" -eq 0 ] && has_runtime_deps; then
   GA4_CMD=(
     "$PYTHON_BIN"
     "$SCRIPT_DIR/test_ga4.py"
@@ -207,11 +315,14 @@ if [ "$DRY_RUN" -eq 0 ] && has_google_deps; then
     --start-date "$START_DATE"
     --end-date "$END_DATE"
     --output "$SCRIPT_DIR/imports/ga4_daily.csv"
-    --client-secret "$SCRIPT_DIR/ga4-reporting/keys/client_secret_754186957411-ggvs2h3f6pes5checp32fkqlhrjbqcjt.apps.googleusercontent.com.json"
     --token-file "$SCRIPT_DIR/ga4-reporting/keys/oauth_token.json"
     --service-account-file "$SERVICE_ACCOUNT_FILE"
     --auth-mode "$AUTH_MODE"
   )
+
+  if [ "$AUTH_MODE" = "oauth" ]; then
+    GA4_CMD+=(--client-secret "$CLIENT_SECRET_FILE")
+  fi
 
   if [ -n "$AUTH_CODE" ]; then
     GA4_CMD+=(--auth-code "$AUTH_CODE")
@@ -227,20 +338,14 @@ else
 fi
 
 GA4_INPUT="$SCRIPT_DIR/imports/ga4_daily.csv"
-RSS_INPUT="$SCRIPT_DIR/imports/rss_posts.csv"
 
 if [ ! -f "$GA4_INPUT" ] || [ ! -s "$GA4_INPUT" ]; then
   GA4_INPUT="$SCRIPT_DIR/data/ga4_daily.csv"
 fi
 
-if [ ! -f "$RSS_INPUT" ] || [ ! -s "$RSS_INPUT" ]; then
-  RSS_INPUT="$SCRIPT_DIR/data/rss_posts.csv"
-fi
-
 REPORT_CMD=(
   "$SCRIPT_DIR/run_news_views.sh"
   --ga4 "$GA4_INPUT"
-  --rss "$RSS_INPUT"
   --start-date "$START_DATE"
   --end-date "$END_DATE"
 )

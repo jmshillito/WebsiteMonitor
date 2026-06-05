@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import csv
 from email.utils import parsedate_to_datetime
+from html import unescape
+import re
 import sys
+import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -14,13 +17,23 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from get_news import collect_rows as collect_school_news_rows
+
 
 GA4_REQUIRED_COLUMNS = {"school", "date", "views"}
-RSS_REQUIRED_COLUMNS = {"school"}
 DEFAULT_SERVICE_ACCOUNT_FILE = Path("ga4-reporting/keys/service-account.json")
 DEFAULT_VIEWS_SHEET_NAME = "Views and Clicks"
 DEFAULT_POST_IMPACT_SHEET_NAME = "Post Impact"
 DEFAULT_POST_DETAILS_SHEET_NAME = "Post Details"
+DEFAULT_NEWS_POSTS_SHEET_NAME = "News Posts"
+HEADLINE_NEWS_CATEGORY_ID = 13
+HEADLINE_NEWS_CATEGORY_NAME = "Headline News"
+WORDPRESS_API_URL = "https://schools.edu.ky/wp-json/wp/v2/posts"
+WORDPRESS_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 WebsiteMonitor/1.0",
+    "Accept": "application/json,text/plain,*/*",
+}
+SGCAPTCHA_RE = re.compile(r"sgcaptcha/\?r=([^\"'<> ]+)", re.I)
 GA4_SCHOOL_CODES = [
     "CHHS",
     "CIFEC",
@@ -43,7 +56,6 @@ GA4_SCHOOL_CODES = [
 @dataclass(frozen=True)
 class InputPaths:
     ga4: Path
-    rss: Path
     output_dir: Path
     start_date: str | None
     end_date: str | None
@@ -53,10 +65,40 @@ class InputPaths:
     views_sheet_name: str
     post_impact_sheet_name: str
     post_details_sheet_name: str
+    news_posts_sheet_name: str
 
 
 def warn(message: str) -> None:
     print(f"warning: {message}", file=sys.stderr)
+
+
+def open_url_in_browser(url: str) -> bool:
+    candidates = [
+        ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
+        ["pwsh.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
+        ["xdg-open", url],
+    ]
+    for command in candidates:
+        try:
+            result = subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            continue
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def extract_sgcaptcha_url(response_text: str, response_url: str) -> str | None:
+    match = SGCAPTCHA_RE.search(response_text)
+    if not match:
+        return None
+
+    target = match.group(1)
+    if target.startswith("http://") or target.startswith("https://"):
+        return target
+    if target.startswith("/"):
+        return f"https://schools.edu.ky{target}"
+    return f"{response_url.rstrip('/')}/{target.lstrip('/')}"
 
 
 def parse_args() -> InputPaths:
@@ -64,7 +106,6 @@ def parse_args() -> InputPaths:
         description="Correlate GA4 daily views with news posts and write Looker Studio friendly CSVs."
     )
     parser.add_argument("--ga4", type=Path, required=True, help="Path to the GA4 daily report CSV.")
-    parser.add_argument("--rss", type=Path, required=True, help="Path to the RSS/news posts CSV.")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -119,12 +160,17 @@ def parse_args() -> InputPaths:
         default=DEFAULT_POST_DETAILS_SHEET_NAME,
         help="Worksheet name for the per-post detail table.",
     )
+    parser.add_argument(
+        "--news-posts-sheet-name",
+        type=str,
+        default=DEFAULT_NEWS_POSTS_SHEET_NAME,
+        help="Worksheet name for the WordPress Headline News export.",
+    )
 
     args = parser.parse_args()
     spreadsheet_id = None if args.spreadsheet_id is None else str(args.spreadsheet_id).strip() or None
     return InputPaths(
         ga4=args.ga4,
-        rss=args.rss,
         output_dir=args.output_dir,
         start_date=args.start_date,
         end_date=args.end_date,
@@ -134,6 +180,7 @@ def parse_args() -> InputPaths:
         views_sheet_name=args.views_sheet_name,
         post_impact_sheet_name=args.post_impact_sheet_name,
         post_details_sheet_name=args.post_details_sheet_name,
+        news_posts_sheet_name=args.news_posts_sheet_name,
     )
 
 
@@ -215,6 +262,15 @@ def normalize_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def normalize_wp_text(value: Any) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+    text = unescape(text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def to_number(value: Any) -> float | int | None:
     text = normalize_text(value)
     if text == "":
@@ -244,6 +300,72 @@ def format_number(value: Any) -> str:
 
 def format_output_date(value: date | None) -> str:
     return "" if value is None else value.strftime("%Y-%m-%d")
+
+
+def infer_school_from_headline_news(post: dict[str, Any]) -> str:
+    link = normalize_text(post.get("link")).lower()
+    slug = normalize_text(post.get("slug")).lower()
+    title = normalize_wp_text(post.get("title")).lower()
+
+    alias_map = [
+        (("schools.edu.ky/csbs/", "csbs"), "SBPS"),
+        (("schools.edu.ky/emmps/", "emmps"), "EMPS"),
+        (("schools.edu.ky/lhs/", "lhs"), "LHSS"),
+        (("schools.edu.ky/lshs/", "lshs"), "LSHS"),
+        (("schools.edu.ky/pps/", "pps"), "PPPS"),
+        (("schools.edu.ky/ppps/", "ppps"), "PPPS"),
+        (("schools.edu.ky/chhs/", "chhs"), "CHHS"),
+        (("schools.edu.ky/cifec/", "cifec"), "CIFEC"),
+        (("schools.edu.ky/eeps/", "eeps"), "EEPS"),
+        (("schools.edu.ky/jacps/", "jacps"), "JACPS"),
+        (("schools.edu.ky/jcps/", "jcps"), "JCPS"),
+        (("schools.edu.ky/jghs/", "jghs"), "JGHS"),
+        (("schools.edu.ky/mmps/", "mmps"), "MMPS"),
+        (("schools.edu.ky/rbps/", "rbps"), "RBPS"),
+        (("schools.edu.ky/tmps/", "tmps"), "TMPS"),
+        (("schools.edu.ky/weps/", "weps"), "WEPS"),
+    ]
+    for needles, school in alias_map:
+        if any(needle in link or needle in slug or needle in title for needle in needles):
+            return school
+    return ""
+
+
+def fetch_headline_news_posts(
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in collect_school_news_rows():
+        date_text = normalize_text(row.get("Date"))
+        if not date_text:
+            continue
+
+        try:
+            post_date = parse_iso_date(date_text, "News post date")
+        except ValueError:
+            continue
+
+        rows.append(
+            {
+                "date": post_date,
+                "school": normalize_school(row.get("School")),
+                "title": normalize_wp_text(row.get("Title")),
+                "url": normalize_text(row.get("URL")),
+                "slug": normalize_text(row.get("Slug")),
+                "category": HEADLINE_NEWS_CATEGORY_NAME,
+            }
+        )
+
+    return rows
+
+
+def filter_news_posts_by_date(
+    news_posts: list[dict[str, Any]],
+    month_start: date | None,
+    month_end: date | None,
+) -> list[dict[str, Any]]:
+    if month_start is None or month_end is None:
+        return list(news_posts)
+    return [row for row in news_posts if isinstance(row.get("date"), date) and month_start <= row["date"] <= month_end]
 
 
 def safe_mean(values: list[float | int]) -> float | None:
@@ -301,40 +423,12 @@ def prepare_ga4(rows: list[dict[str, str]], month_start: date | None, month_end:
     return prepared
 
 
-def prepare_rss(rows: list[dict[str, str]], month_start: date | None, month_end: date | None) -> list[dict[str, Any]]:
-    prepared: list[dict[str, Any]] = []
-    for raw in rows:
-        row = {str(key).strip().lower(): value for key, value in raw.items()}
-
-        school_source = row.get("ga4 school") if row.get("ga4 school") else row.get("school")
-        school = normalize_school(school_source)
-        if not school or school.startswith("UPDATED ON"):
-            continue
-
-        post_date_raw = row.get("post_date") or row.get("last date")
-        if not post_date_raw:
-            continue
-
-        post_date = parse_iso_date(post_date_raw, "RSS post_date")
-        if month_start is not None and month_end is not None and not (month_start <= post_date <= month_end):
-            continue
-
-        prepared.append(
-            {
-                "school": school,
-                "post_date": post_date,
-                "post_title": normalize_text(row.get("post_title") or row.get("title")),
-                "post_url": normalize_text(row.get("post_url") or row.get("link")),
-            }
-        )
-
-    return prepared
-
-
-def build_news_daily_summary(rss: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_news_daily_summary(news_posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     counts: dict[tuple[str, date], int] = defaultdict(int)
-    for row in rss:
-        counts[(row["school"], row["post_date"])] += 1
+    for row in news_posts:
+        if not row.get("school") or not isinstance(row.get("date"), date):
+            continue
+        counts[(row["school"], row["date"])] += 1
 
     return [
         {"school": school, "date": post_date, "news_posts_count": count}
@@ -433,7 +527,7 @@ def build_school_summary(merged: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return records
 
 
-def build_event_impact(rss: list[dict[str, Any]], merged: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_event_impact(news_posts: list[dict[str, Any]], merged: list[dict[str, Any]]) -> list[dict[str, Any]]:
     views_lookup: dict[tuple[str, date], list[float]] = defaultdict(list)
     for row in merged:
         views_lookup[(row["school"], row["date"])].append(float(row["views"]))
@@ -445,9 +539,9 @@ def build_event_impact(rss: list[dict[str, Any]], merged: list[dict[str, Any]]) 
         school_dates[school].sort(key=lambda item: item[0])
 
     event_rows: list[dict[str, Any]] = []
-    for post in sorted(rss, key=lambda row: (row["school"], row["post_date"], row["post_title"])):
+    for post in sorted(news_posts, key=lambda row: (row["school"], row["date"], row["title"])):
         school = post["school"]
-        post_date = post["post_date"]
+        post_date = post["date"]
         rows = school_dates.get(school, [])
 
         views_on_post_day = safe_mean(views_lookup.get((school, post_date), []))
@@ -464,8 +558,8 @@ def build_event_impact(rss: list[dict[str, Any]], merged: list[dict[str, Any]]) 
             {
                 "school": school,
                 "post_date": post_date,
-                "post_title": post["post_title"],
-                "post_url": post["post_url"],
+                "post_title": post["title"],
+                "post_url": post["url"],
                 "views_on_post_day": views_on_post_day,
                 "avg_views_3_days_before": avg_before,
                 "avg_views_3_days_after": avg_after,
@@ -478,12 +572,12 @@ def build_event_impact(rss: list[dict[str, Any]], merged: list[dict[str, Any]]) 
     return event_rows
 
 
-def warn_school_mismatches(ga4: list[dict[str, Any]], rss: list[dict[str, Any]]) -> None:
+def warn_school_mismatches(ga4: list[dict[str, Any]], news_posts: list[dict[str, Any]]) -> None:
     ga4_schools = {row["school"] for row in ga4}
-    rss_schools = {row["school"] for row in rss}
-    unexpected_rss = sorted(rss_schools - ga4_schools)
-    if unexpected_rss:
-        warn(f"RSS school codes not found in GA4 data: {unexpected_rss}")
+    news_schools = {row["school"] for row in news_posts if row.get("school")}
+    unexpected_news = sorted(news_schools - ga4_schools)
+    if unexpected_news:
+        warn(f"News post school codes not found in GA4 data: {unexpected_news}")
 
 
 def format_cell(value: Any) -> str:
@@ -569,6 +663,27 @@ def build_post_details_sheet(events: list[dict[str, Any]]) -> list[list[str]]:
     return [headers] + [[format_cell(row.get(column)) for column in columns] for row in rows]
 
 
+def build_news_posts_sheet(news_posts: list[dict[str, Any]]) -> list[list[str]]:
+    rows = sorted(news_posts, key=lambda row: (row["date"], row["title"]), reverse=True)
+    columns = ["date", "school", "title", "url", "slug", "category"]
+    return [columns] + [[format_cell(row.get(column)) for column in columns] for row in rows]
+
+
+def build_news_posts_raw_rows(news_posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = sorted(news_posts, key=lambda row: (row["date"], row["title"]), reverse=True)
+    return [
+        {
+            "date": row.get("date"),
+            "title": row.get("title"),
+            "link": row.get("url"),
+            "slug": row.get("slug"),
+            "school": row.get("school"),
+            "category": row.get("category"),
+        }
+        for row in rows
+    ]
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
@@ -589,9 +704,11 @@ def maybe_upload_to_sheets(
     views_sheet_name: str,
     post_impact_sheet_name: str,
     post_details_sheet_name: str,
+    news_posts_sheet_name: str,
     merged: list[dict[str, Any]],
     summary: list[dict[str, Any]],
     events: list[dict[str, Any]],
+    news_posts: list[dict[str, Any]],
     month: str | None,
 ) -> bool:
     try:
@@ -620,7 +737,11 @@ def maybe_upload_to_sheets(
         str(sheet.get("properties", {}).get("title", "")).strip()
         for sheet in spreadsheet.get("sheets", [])
     }
-    missing = [sheet_name for sheet_name in [views_sheet_name, post_impact_sheet_name, post_details_sheet_name] if sheet_name not in existing]
+    missing = [
+        sheet_name
+        for sheet_name in [views_sheet_name, post_impact_sheet_name, post_details_sheet_name, news_posts_sheet_name]
+        if sheet_name not in existing
+    ]
     if missing:
         requests = [{"addSheet": {"properties": {"title": sheet_name}}} for sheet_name in missing]
         service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
@@ -629,6 +750,7 @@ def maybe_upload_to_sheets(
         (views_sheet_name, build_views_and_clicks_sheet(merged, month)),
         (post_impact_sheet_name, build_post_impact_sheet(summary)),
         (post_details_sheet_name, build_post_details_sheet(events)),
+        (news_posts_sheet_name, build_news_posts_sheet(news_posts)),
     ]
     for sheet_name, rows in sheets_payload:
         service.spreadsheets().values().clear(
@@ -643,7 +765,7 @@ def maybe_upload_to_sheets(
         ).execute()
 
     print(
-        f"Uploaded {views_sheet_name}, {post_impact_sheet_name}, and {post_details_sheet_name} "
+        f"Uploaded {views_sheet_name}, {post_impact_sheet_name}, {post_details_sheet_name}, and {news_posts_sheet_name} "
         f"to spreadsheet {spreadsheet_id}"
     )
     return True
@@ -654,12 +776,15 @@ def write_outputs(
     merged: list[dict[str, Any]],
     summary: list[dict[str, Any]],
     events: list[dict[str, Any]],
+    news_posts: list[dict[str, Any]],
+    news_posts_raw: list[dict[str, Any]],
     run_stamp: str,
     spreadsheet_id: str | None = None,
     service_account_file: Path | None = None,
     views_sheet_name: str = DEFAULT_VIEWS_SHEET_NAME,
     post_impact_sheet_name: str = DEFAULT_POST_IMPACT_SHEET_NAME,
     post_details_sheet_name: str = DEFAULT_POST_DETAILS_SHEET_NAME,
+    news_posts_sheet_name: str = DEFAULT_NEWS_POSTS_SHEET_NAME,
     month: str | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -668,9 +793,15 @@ def write_outputs(
     merged_path = output_dir / "merged_news_views_daily.csv"
     summary_path = output_dir / "news_views_school_summary.csv"
     events_path = output_dir / "news_post_event_impact.csv"
+    news_posts_path = output_dir / "news_posts.csv"
+    news_posts_compat_path = output_dir / "NewsPosts.csv"
+    news_posts_raw_path = output_dir / "news_posts_rest_raw.csv"
     merged_dated_path = output_dir / f"merged_news_views_daily_{run_stamp}.csv"
     summary_dated_path = output_dir / f"news_views_school_summary_{run_stamp}.csv"
     events_dated_path = output_dir / f"news_post_event_impact_{run_stamp}.csv"
+    news_posts_dated_path = output_dir / f"news_posts_{run_stamp}.csv"
+    news_posts_compat_dated_path = output_dir / f"NewsPosts_{run_stamp}.csv"
+    news_posts_raw_dated_path = output_dir / f"news_posts_rest_raw_{run_stamp}.csv"
 
     merged_columns = [
         "school",
@@ -728,6 +859,8 @@ def write_outputs(
     if events and "month" not in events[0]:
         events_columns = [column for column in events_columns if column != "month"]
 
+    news_posts_columns = ["date", "school", "title", "url", "slug", "category"]
+
     if merged:
         write_csv(dataset_path, merged, merged_columns)
         write_csv(dataset_dated_path, merged, merged_columns)
@@ -751,14 +884,38 @@ def write_outputs(
         for path in [events_path, events_dated_path]:
             write_csv(path, [], events_columns)
 
+    if news_posts:
+        write_csv(news_posts_path, news_posts, news_posts_columns)
+        write_csv(news_posts_compat_path, news_posts, news_posts_columns)
+        write_csv(news_posts_dated_path, news_posts, news_posts_columns)
+        write_csv(news_posts_compat_dated_path, news_posts, news_posts_columns)
+    else:
+        for path in [news_posts_path, news_posts_compat_path, news_posts_dated_path, news_posts_compat_dated_path]:
+            write_csv(path, [], news_posts_columns)
+
+    raw_rows = build_news_posts_raw_rows(news_posts_raw)
+    raw_columns = ["date", "title", "link", "slug", "school", "category"]
+    if raw_rows:
+        write_csv(news_posts_raw_path, raw_rows, raw_columns)
+        write_csv(news_posts_raw_dated_path, raw_rows, raw_columns)
+    else:
+        for path in [news_posts_raw_path, news_posts_raw_dated_path]:
+            write_csv(path, [], raw_columns)
+
     print(f"Wrote {dataset_path}")
     print(f"Wrote {dataset_dated_path}")
     print(f"Wrote {merged_path}")
     print(f"Wrote {summary_path}")
     print(f"Wrote {events_path}")
+    print(f"Wrote {news_posts_path}")
+    print(f"Wrote {news_posts_compat_path}")
+    print(f"Wrote {news_posts_raw_path}")
     print(f"Wrote {merged_dated_path}")
     print(f"Wrote {summary_dated_path}")
     print(f"Wrote {events_dated_path}")
+    print(f"Wrote {news_posts_dated_path}")
+    print(f"Wrote {news_posts_compat_dated_path}")
+    print(f"Wrote {news_posts_raw_dated_path}")
 
     if spreadsheet_id:
         uploaded = maybe_upload_to_sheets(
@@ -767,9 +924,11 @@ def write_outputs(
             views_sheet_name,
             post_impact_sheet_name,
             post_details_sheet_name,
+            news_posts_sheet_name,
             merged,
             summary,
             events,
+            news_posts,
             month,
         )
         if not uploaded:
@@ -782,19 +941,25 @@ def main() -> int:
         run_label, month_start, month_end = parse_date_range(args.month, args.start_date, args.end_date)
 
         ga4_raw = load_csv(args.ga4, "GA4")
-        rss_raw = load_csv(args.rss, "RSS")
-
         ga4 = prepare_ga4(ga4_raw, month_start, month_end)
-        rss = prepare_rss(rss_raw, month_start, month_end)
 
         if not ga4:
             warn("GA4 data is empty after filtering.")
-        if not rss:
-            warn("RSS data is empty after filtering.")
 
-        warn_school_mismatches(ga4, rss)
+        try:
+            news_posts_raw = fetch_headline_news_posts()
+        except Exception as exc:
+            warn(f"Headline News REST fetch failed: {exc}")
+            news_posts_raw = []
 
-        news_daily = build_news_daily_summary(rss)
+        if not news_posts_raw:
+            warn("Headline News REST data is empty after fetch.")
+
+        news_posts_in_range = filter_news_posts_by_date(news_posts_raw, month_start, month_end)
+
+        warn_school_mismatches(ga4, news_posts_in_range)
+
+        news_daily = build_news_daily_summary(news_posts_in_range)
         news_daily_lookup = {(row["school"], row["date"]): row["news_posts_count"] for row in news_daily}
 
         merged: list[dict[str, Any]] = []
@@ -815,7 +980,7 @@ def main() -> int:
 
         merged = add_rolling_post_flags(merged, news_daily)
         summary = build_school_summary(merged)
-        events = build_event_impact(rss, merged)
+        events = build_event_impact(news_posts_in_range, merged)
 
         if run_label is not None:
             for row in merged:
@@ -831,12 +996,15 @@ def main() -> int:
             merged,
             summary,
             events,
+            news_posts_in_range,
+            news_posts_raw,
             run_stamp,
             spreadsheet_id=args.spreadsheet_id,
             service_account_file=args.service_account_file,
             views_sheet_name=args.views_sheet_name,
             post_impact_sheet_name=args.post_impact_sheet_name,
             post_details_sheet_name=args.post_details_sheet_name,
+            news_posts_sheet_name=args.news_posts_sheet_name,
             month=args.month,
         )
         return 0

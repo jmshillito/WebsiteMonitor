@@ -57,6 +57,14 @@ GA4_SCHOOL_ALIASES = {
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_STATE_FILE = BASE_DIR / "last_seen_posts.json"
 USER_AGENT = "Mozilla/5.0 (compatible; WebsiteMonitor/1.0)"
+INVALID_XML_CHARS = re.compile(
+    "["
+    "\x00-\x08"
+    "\x0b"
+    "\x0c"
+    "\x0e-\x1f"
+    "]"
+)
 
 
 def load_state(state_file: Path) -> dict[str, list[str]]:
@@ -128,6 +136,57 @@ def download_url(url: str) -> bytes:
     return result.stdout
 
 
+def sanitize_xml_text(text: str) -> str:
+    text = INVALID_XML_CHARS.sub("", text)
+    text = text.replace("\ufeff", "")
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"&(?!#\d+;|#x[0-9a-fA-F]+;|[A-Za-z][A-Za-z0-9]+;)", "&amp;", text)
+    return text
+
+
+def clean_html_text(text: str) -> str:
+    return unescape(re.sub(r"<[^>]+>", "", text).strip())
+
+
+def parse_rss_items(text: str) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for block in re.findall(r"<item\b.*?</item>", text, flags=re.S | re.I):
+        id_match = re.search(r"<guid[^>]*>(.*?)</guid>", block, flags=re.S | re.I)
+        if not id_match:
+            id_match = re.search(r"<link[^>]*>(.*?)</link>", block, flags=re.S | re.I)
+        link_match = re.search(r"<link[^>]*>(.*?)</link>", block, flags=re.S | re.I)
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", block, flags=re.S | re.I)
+        date_match = re.search(r"<pubDate[^>]*>(.*?)</pubDate>", block, flags=re.S | re.I)
+
+        if not id_match or not link_match:
+            continue
+
+        entries.append(
+            {
+                "id": unescape(re.sub(r"<[^>]+>", "", id_match.group(1)).strip()),
+                "title": unescape(re.sub(r"<[^>]+>", "", title_match.group(1)).strip()) if title_match else "No title",
+                "link": unescape(re.sub(r"<[^>]+>", "", link_match.group(1)).strip()),
+                "date": unescape(re.sub(r"<[^>]+>", "", date_match.group(1)).strip()) if date_match else "No date",
+            }
+        )
+
+    return entries
+
+
+def normalize_wp_date(date_text: str) -> str:
+    if not date_text:
+        return "No date"
+
+    candidates = [date_text, date_text.replace("Z", "+00:00")]
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        return parsed.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+    return date_text
+
+
 def normalize_csbs_date(date_text: str) -> str:
     """Convert CSBS archive dates into the same RFC-style format as the feeds."""
     if not date_text or date_text == "No date":
@@ -156,29 +215,100 @@ def ga4_school_name(school_name: str) -> str:
 
 def fetch_feed(feed_slug: str) -> tuple[list[dict[str, str]], str]:
     url = f"https://schools.edu.ky/{feed_slug}/feed/"
-    data = download_url(url)
-
     try:
-        root = ET.fromstring(data)
-    except ET.ParseError as exc:
-        raise ValueError(f"Failed to parse feed XML: {exc}") from exc
+        data = download_url(url)
+        text = data.decode("utf-8", errors="replace")
+        cleaned_text = sanitize_xml_text(text)
 
-    entries: list[dict[str, str]] = []
-    for item in root.findall("./channel/item"):
-        post_id = item.findtext("guid") or item.findtext("link")
-        if not post_id:
+        try:
+            root = ET.fromstring(cleaned_text)
+        except ET.ParseError:
+            entries = parse_rss_items(cleaned_text)
+            if entries:
+                return entries, url
+        else:
+            entries: list[dict[str, str]] = []
+            for item in root.findall("./channel/item"):
+                post_id = item.findtext("guid") or item.findtext("link")
+                if not post_id:
+                    continue
+
+                entries.append(
+                    {
+                        "id": str(post_id),
+                        "title": str(item.findtext("title") or "No title"),
+                        "link": str(item.findtext("link") or ""),
+                        "date": str(
+                            item.findtext("pubDate")
+                            or item.findtext("{http://purl.org/dc/elements/1.1/}date")
+                            or "No date"
+                        ),
+                    }
+                )
+
+            return entries, url
+    except (HTTPError, URLError):
+        raise
+
+    return fetch_wordpress_rest_posts(feed_slug)
+
+
+def fetch_wordpress_rest_posts(feed_slug: str) -> tuple[list[dict[str, str]], str]:
+    school_slug = feed_slug.split("/", 1)[0]
+    endpoint_candidates = [
+        f"https://schools.edu.ky/{school_slug}/wp-json/wp/v2/posts?per_page=100&orderby=date&order=desc&_fields=date,link,slug,title,categories",
+        "https://schools.edu.ky/wp-json/wp/v2/posts?per_page=100&orderby=date&order=desc&_fields=date,link,slug,title,categories",
+    ]
+    prefixes = [f"https://schools.edu.ky/{school_slug}/"]
+    if school_slug in {"chhs", "jghs"}:
+        prefixes.insert(0, "https://schools.edu.ky/blog/")
+
+    for url in endpoint_candidates:
+        try:
+            payload = json.loads(download_url(url).decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, HTTPError, URLError, ValueError):
             continue
 
-        entries.append(
-            {
-                "id": str(post_id),
-                "title": str(item.findtext("title") or "No title"),
-                "link": str(item.findtext("link") or ""),
-                "date": str(item.findtext("pubDate") or item.findtext("{http://purl.org/dc/elements/1.1/}date") or "No date"),
-            }
-        )
+        if not isinstance(payload, list):
+            continue
 
-    return entries, url
+        entries: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for post in payload:
+            if not isinstance(post, dict):
+                continue
+            link = str(post.get("link") or "")
+            if not link or not any(link.startswith(prefix) for prefix in prefixes):
+                continue
+            if link in seen:
+                continue
+
+            title_data = post.get("title")
+            if isinstance(title_data, dict):
+                title = clean_html_text(str(title_data.get("rendered", "")))
+            else:
+                title = clean_html_text(str(title_data or ""))
+            if not title:
+                slug = link.rstrip("/").rsplit("/", 1)[-1]
+                title = clean_html_text(slug.replace("-", " ").title())
+            if not title:
+                continue
+
+            entries.append(
+                {
+                    "id": link,
+                    "title": title,
+                    "link": link,
+                    "date": normalize_wp_date(str(post.get("date") or "No date")),
+                }
+            )
+            seen.add(link)
+
+        if entries:
+            entries.sort(key=lambda row: row["date"], reverse=True)
+            return entries, url
+
+    return [], endpoint_candidates[0]
 
 
 def fetch_csbs_archive() -> tuple[list[dict[str, str]], str]:
@@ -350,9 +480,9 @@ def main() -> int:
     print(f"Updated on {updated_on}")
 
     if errors:
-        print("\nErrors:\n")
+        print("\nWarnings:\n")
         for error in errors:
-            print(f"- {error}")
+            print(f"- warning: {error}")
 
     return 0
 

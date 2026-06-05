@@ -26,7 +26,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 DEFAULT_OUTPUT = Path("imports/ga4_daily.csv")
 DEFAULT_KEYS_DIR = Path("ga4-reporting/keys")
-DEFAULT_CLIENT_SECRET = DEFAULT_KEYS_DIR / "client_secret_754186957411-ggvs2h3f6pes5checp32fkqlhrjbqcjt.apps.googleusercontent.com.json"
+DEFAULT_CLIENT_SECRET = DEFAULT_KEYS_DIR / "client_secret_463400512765-k9faff977lqifvpiqt69263r8c9dnr6e.apps.googleusercontent.com.json"
 DEFAULT_TOKEN_FILE = DEFAULT_KEYS_DIR / "oauth_token.json"
 DEFAULT_SERVICE_ACCOUNT_FILE = DEFAULT_KEYS_DIR / "service-account.json"
 DEFAULT_PROPERTY_MAP = Path("ga4-reporting/property_ids.tsv")
@@ -34,7 +34,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/webmasters.readonly",
 ]
-AUTH_MODES = {"auto", "oauth", "service-account"}
+AUTH_MODES = {"oauth", "service-account"}
+SEARCH_CONSOLE_SITE_ALIASES = {
+    "EMPS": ["https://schools.edu.ky/emmps/", "https://schools.edu.ky/emps/"],
+    "LHSS": ["https://schools.edu.ky/lhs/", "https://schools.edu.ky/lshs/"],
+    "SBPS": ["https://schools.edu.ky/csbs/", "https://schools.edu.ky/sbps/"],
+    "PPPS": ["https://schools.edu.ky/pps/", "https://schools.edu.ky/ppps/"],
+}
 
 
 @dataclass(frozen=True)
@@ -94,7 +100,7 @@ def parse_args() -> Args:
     parser.add_argument(
         "--auth-mode",
         choices=sorted(AUTH_MODES),
-        default="auto",
+        default="service-account",
         help="Authentication mode. service-account is silent; oauth can prompt for authorization.",
     )
     parser.add_argument(
@@ -164,6 +170,18 @@ def load_service_account_credentials(service_account_path: Path) -> Credentials:
     return service_account.Credentials.from_service_account_file(service_account_path, scopes=SCOPES)
 
 
+def resolve_auth_credentials_path(
+    auth_mode: str,
+    client_secret_path: Path,
+    service_account_path: Path,
+) -> Path:
+    if auth_mode == "service-account":
+        return service_account_path
+    if auth_mode == "oauth":
+        return client_secret_path
+    raise ValueError(f"unsupported auth mode: {auth_mode}")
+
+
 def load_credentials(
     client_secret_path: Path,
     token_file_path: Path,
@@ -171,13 +189,15 @@ def load_credentials(
     auth_mode: str,
     auth_code: str | None = None,
 ) -> Credentials:
+    credential_path = resolve_auth_credentials_path(auth_mode, client_secret_path, service_account_path)
+    print(f"Using GA4 auth mode: {auth_mode}", file=sys.stderr)
+    print(f"Using GA4 credentials: {credential_path}", file=sys.stderr)
+
     if auth_mode == "service-account":
-        return load_service_account_credentials(service_account_path)
+        return load_service_account_credentials(credential_path)
     if auth_mode == "oauth":
-        return load_oauth_credentials(client_secret_path, token_file_path, auth_code)
-    if service_account_path.exists():
-        return load_service_account_credentials(service_account_path)
-    return load_oauth_credentials(client_secret_path, token_file_path, auth_code)
+        return load_oauth_credentials(credential_path, token_file_path, auth_code)
+    raise ValueError(f"unsupported auth mode: {auth_mode}")
 
 
 def load_property_map(path: Path) -> list[SchoolProperties]:
@@ -307,6 +327,37 @@ def iter_search_console_rows(
         }
 
 
+def iter_search_console_rows_with_fallback(
+    client,
+    school: str,
+    site_url: str | None,
+    start_date: str,
+    end_date: str,
+) -> Iterable[dict[str, str]]:
+    candidates: list[str] = []
+    if site_url:
+        candidates.append(site_url)
+    candidates.extend(SEARCH_CONSOLE_SITE_ALIASES.get(school, []))
+
+    seen: set[str] = set()
+    last_exc: Exception | None = None
+
+    for candidate in candidates:
+        normalized = candidate.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            yield from iter_search_console_rows(client, normalized, start_date, end_date)
+            return
+        except (GoogleAPIError, HttpError) as exc:
+            last_exc = exc
+            continue
+
+    if last_exc is not None:
+        raise last_exc
+
+
 def build_daily_rows(
     ga4_client: BetaAnalyticsDataClient,
     search_console_client,
@@ -339,8 +390,9 @@ def build_daily_rows(
             )
 
         try:
-            for row in iter_search_console_rows(
+            for row in iter_search_console_rows_with_fallback(
                 search_console_client,
+                school_properties.school,
                 school_properties.search_console_property,
                 start_date,
                 end_date,
